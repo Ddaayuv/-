@@ -119,6 +119,7 @@ class QuizQuestion(Base):
     question: Mapped[str] = mapped_column(Text)
     options_json: Mapped[str] = mapped_column(Text)
     correct_option_index: Mapped[int] = mapped_column(Integer)
+    explanation: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
 
 class QuizAttempt(Base):
@@ -154,6 +155,56 @@ class QuizResponse(Base):
     answered_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
 
+class QuizSession(Base):
+    """A quiz published into a group/supergroup (with a leaderboard)."""
+    __tablename__ = "quiz_sessions"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    quiz_id: Mapped[int] = mapped_column(ForeignKey("quizzes.id", ondelete="CASCADE"), index=True)
+    chat_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    chat_title: Mapped[str] = mapped_column(String(200), default="")
+    started_by: Mapped[int] = mapped_column(BigInteger, default=0)
+    total_questions: Mapped[int] = mapped_column(Integer, default=0)
+    status: Mapped[str] = mapped_column(String(20), default="publishing")
+    control_message_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
+
+class QuizSessionPoll(Base):
+    __tablename__ = "quiz_session_polls"
+    poll_id: Mapped[str] = mapped_column(String(200), primary_key=True)
+    session_id: Mapped[int] = mapped_column(ForeignKey("quiz_sessions.id", ondelete="CASCADE"), index=True)
+    question_number: Mapped[int] = mapped_column(Integer)
+    correct_option_index: Mapped[int] = mapped_column(Integer)
+    message_id: Mapped[int] = mapped_column(BigInteger)
+
+
+class QuizSessionAnswer(Base):
+    __tablename__ = "quiz_session_answers"
+    __table_args__ = (UniqueConstraint("session_id", "user_telegram_id", "question_number", name="uq_session_user_question"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    session_id: Mapped[int] = mapped_column(ForeignKey("quiz_sessions.id", ondelete="CASCADE"), index=True)
+    user_telegram_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    user_name: Mapped[str] = mapped_column(String(200), default="")
+    question_number: Mapped[int] = mapped_column(Integer)
+    selected_option_index: Mapped[int] = mapped_column(Integer)
+    is_correct: Mapped[bool] = mapped_column(Boolean, default=False)
+    answered_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+class QuizTarget(Base):
+    """A channel/group the bot can publish quizzes to."""
+    __tablename__ = "quiz_targets"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    chat_id: Mapped[int] = mapped_column(BigInteger, unique=True, index=True)
+    kind: Mapped[str] = mapped_column(String(20), default="channel")
+    title: Mapped[str] = mapped_column(String(200), default="")
+    username: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    added_by: Mapped[int] = mapped_column(BigInteger, default=0)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
 connect_args = {"timeout": 30} if settings.db_url.startswith("sqlite") else {}
 engine = create_async_engine(settings.db_url, connect_args=connect_args, pool_pre_ping=True)
 if settings.db_url.startswith("sqlite"):
@@ -168,6 +219,9 @@ def _sync_migrations(conn):
     inspector=inspect(conn); subject_columns={c["name"] for c in inspector.get_columns("subjects")} if inspector.has_table("subjects") else set(); item_columns={c["name"] for c in inspector.get_columns("items")} if inspector.has_table("items") else set(); add_practical="has_practical" not in subject_columns; add_mode="study_mode" not in item_columns
     if add_practical: conn.execute(text(f"ALTER TABLE subjects ADD COLUMN has_practical BOOLEAN NOT NULL DEFAULT {'0' if conn.dialect.name=='sqlite' else 'FALSE'}"))
     if add_mode: conn.execute(text("ALTER TABLE items ADD COLUMN study_mode VARCHAR(20) NOT NULL DEFAULT 'general'"))
+    # quiz explanations: create_all does not add columns to tables that already exist
+    question_columns={c["name"] for c in inspector.get_columns("quiz_questions")} if inspector.has_table("quiz_questions") else set()
+    if question_columns and "explanation" not in question_columns: conn.execute(text("ALTER TABLE quiz_questions ADD COLUMN explanation TEXT"))
     return add_practical,add_mode
 def snapshot_sqlite() -> str | None:
     """Copy the SQLite file next to itself before migrations so nothing can be lost silently."""
