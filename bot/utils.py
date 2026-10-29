@@ -23,3 +23,15 @@ def is_url(value: str) -> bool:
 
 def esc(value: str) -> str:
     return (value or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+def parse_chat_ref(raw: str):
+    """Turn @username, t.me/username, or a numeric id into something get_chat() accepts."""
+    raw = (raw or "").strip()
+    m = re.search(r"(?:https?://)?t\.me/([A-Za-z][A-Za-z0-9_]{3,})", raw)
+    if m:
+        return "@" + m.group(1)
+    if re.fullmatch(r"@[A-Za-z][A-Za-z0-9_]{3,}", raw):
+        return raw
+    if re.fullmatch(r"-?\d{5,}", raw):
+        return int(raw)
+    return None
