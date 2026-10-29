@@ -5,6 +5,9 @@ import re
 import unicodedata
 from typing import Any
 
+MAX_EXPLANATION = 200   # Telegram limit for a quiz poll explanation
+MAX_TITLE = 200
+
 _ARABIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
 _ORDINALS = r"(?:الأول|الاول|الأولى|الاولى|الثاني|الثانية|الثالث|الثالثة|الرابع|الرابعة|الخامس|الخامسة|السادس|السادسة|السابع|السابعة|الثامن|الثامنة|التاسع|التاسعة|العاشر|العاشرة|\d+)"
 _QUESTION_START = re.compile(
@@ -17,6 +20,10 @@ _QUESTION_START = re.compile(
 _OPTION_START = re.compile(r"^\s*(?P<label>[A-Za-z]|[ء-ي]{1,2})\s*[).．.：:\-]\s*(?P<text>.*?)\s*$")
 _ANSWER_START = re.compile(
     r"^\s*(?:الإجابة\s*الصحيحة|الاجابة\s*الصحيحة|الإجابة|الاجابة|correct(?:\s+answer)?)\s*[:：=\-]\s*(.*?)\s*$",
+    re.IGNORECASE,
+)
+_EXPLANATION_START = re.compile(
+    r"^\s*(?:الشرح|التوضيح|التفسير|توضيح|شرح|explanation|explain)\s*[:：=\-]\s*(.*?)\s*$",
     re.IGNORECASE,
 )
 
@@ -40,15 +47,20 @@ def _key(value: str) -> str:
     return value
 
 
-def _split_blocks(raw: str) -> list[list[str]]:
+def _split_blocks(raw: str) -> tuple[str, list[str], list[list[str]]]:
+    """Returns (title, preamble_extra_lines, blocks). Text before the first explicit question
+    start is the preamble: its first line is the quiz title."""
     lines = [_clean_line(line) for line in (raw or "").replace("\r", "\n").split("\n")]
     blocks: list[list[str]] = []
     current: list[str] = []
+    preamble: list[str] = []
     saw_explicit_start = False
     for line in lines:
         match = _QUESTION_START.match(line)
         if match:
-            if current and any(x.strip() for x in current):
+            if not saw_explicit_start:
+                preamble = [x for x in current if x.strip()]
+            elif current and any(x.strip() for x in current):
                 blocks.append(current)
             current = []
             remainder = (match.group(1) or "").strip()
@@ -57,11 +69,12 @@ def _split_blocks(raw: str) -> list[list[str]]:
             saw_explicit_start = True
         else:
             current.append(line)
-    if current and any(x.strip() for x in current):
-        blocks.append(current)
-    if not saw_explicit_start:
-        return [lines] if any(line.strip() for line in lines) else []
-    return blocks
+    if saw_explicit_start:
+        if current and any(x.strip() for x in current):
+            blocks.append(current)
+        title = preamble[0][:MAX_TITLE] if preamble else ""
+        return title, preamble[1:], blocks
+    return "", [], ([lines] if any(line.strip() for line in lines) else [])
 
 
 def _explicit_question_numbers(raw: str) -> list[int]:
@@ -90,15 +103,21 @@ def _explicit_question_numbers(raw: str) -> list[int]:
 
 def parse_quiz_text(raw: str) -> dict[str, Any]:
     if not isinstance(raw, str) or not raw.strip():
-        return {"questions": [], "issues": ["أرسل نص الأسئلة أولاً."], "detected_count": 0, "valid_count": 0}
-    blocks = _split_blocks(raw)
+        return {"title": "", "questions": [], "issues": ["أرسل نص الأسئلة أولاً."], "warnings": [],
+                "detected_count": 0, "valid_count": 0}
+    title, extra_preamble, blocks = _split_blocks(raw)
     questions: list[dict[str, Any]] = []
     issues: list[str] = []
+    warnings: list[str] = []
+    if extra_preamble:
+        warnings.append("تم تجاهل الأسطر الإضافية قبل أول سؤال؛ يُستخدم أول سطر فقط كعنوان.")
     for number, lines in enumerate(blocks, 1):
         stem_lines: list[str] = []
         options: list[dict[str, str]] = []
+        explanation_parts: list[str] = []
         correct_raw: str | None = None
         after_answer = False
+        in_explanation = False
         for line in lines:
             if not line.strip():
                 continue
@@ -106,6 +125,15 @@ def parse_quiz_text(raw: str) -> dict[str, Any]:
             if answer_match:
                 correct_raw = (answer_match.group(1) or "").strip()
                 after_answer = True
+                in_explanation = False
+                continue
+            explanation_match = _EXPLANATION_START.match(line)
+            if explanation_match:
+                explanation_parts.append((explanation_match.group(1) or "").strip())
+                in_explanation = True
+                continue
+            if in_explanation:
+                explanation_parts.append(line.strip())
                 continue
             option_match = _OPTION_START.match(line)
             if option_match and not after_answer:
@@ -121,6 +149,10 @@ def parse_quiz_text(raw: str) -> dict[str, Any]:
             elif line.strip():
                 issues.append(f"السؤال {number}: يوجد نص بعد سطر الإجابة الصحيحة، راجعه يدوياً.")
         question_text = " ".join(stem_lines).strip()
+        explanation = " ".join(p for p in explanation_parts if p).strip()
+        if len(explanation) > MAX_EXPLANATION:
+            explanation = explanation[:MAX_EXPLANATION].rstrip()
+            warnings.append(f"السؤال {number}: الشرح أطول من {MAX_EXPLANATION} حرفاً، وسيُقصّ عند النشر.")
         item_issues: list[str] = []
         if not question_text:
             item_issues.append("نص السؤال فارغ أو لم يُكتشف")
@@ -171,6 +203,7 @@ def parse_quiz_text(raw: str) -> dict[str, Any]:
             "text": question_text,
             "options": [{"label": option["label"], "text": option["text"]} for option in options],
             "correct_option_index": correct_index,
+            "explanation": explanation or None,
             "issues": item_issues,
         }
         questions.append(question)
@@ -187,4 +220,5 @@ def parse_quiz_text(raw: str) -> dict[str, Any]:
         if len(numeric_headers) != len(seen_numbers):
             issues.append("يوجد رقم سؤال مكرر؛ راجع الترقيم قبل إنشاء الاختبار.")
     valid_count = sum(1 for question in questions if not question["issues"])
-    return {"questions": questions, "issues": issues, "detected_count": len(blocks), "valid_count": valid_count}
+    return {"title": title, "questions": questions, "issues": issues, "warnings": warnings,
+            "detected_count": len(blocks), "valid_count": valid_count}
