@@ -775,8 +775,16 @@ def _format_board(rows, quiz_id: int, total: int, limit: int = 10, *, final: boo
     return "\n".join(lines)
 
 
-async def _latest_session(session, chat_id: int, only_active: bool = False):
-    q = select(QuizSession).where(QuizSession.chat_id == chat_id)
+async def _latest_session(
+    session,
+    chat_id: int,
+    only_active: bool = False,
+    message_thread_id: int | None = None,
+):
+    q = select(QuizSession).where(
+        QuizSession.chat_id == chat_id,
+        QuizSession.message_thread_id == message_thread_id,
+    )
     if only_active:
         q = q.where(QuizSession.status.in_(("publishing", "active")))
     return await session.scalar(q.order_by(QuizSession.id.desc()))
@@ -802,7 +810,11 @@ async def finish_session(bot: Bot, session_id: int) -> bool:
                                  .order_by(QuizSessionPoll.question_number))).all()
         qs.status, qs.finished_at = "closed", utcnow()   # close first: late answers are ignored
         await s.commit()
-        chat_id, control_id, quiz_id, total = qs.chat_id, qs.control_message_id, qs.quiz_id, qs.total_questions
+        chat_id = qs.chat_id
+        thread_id = qs.message_thread_id
+        control_id = qs.control_message_id
+        quiz_id = qs.quiz_id
+        total = qs.total_questions
         rows = await _leaderboard(s, session_id)
     for poll in polls:
         try:
@@ -816,7 +828,11 @@ async def finish_session(bot: Bot, session_id: int) -> bool:
             log.exception("Unexpected error stopping poll=%s in chat=%s", poll.poll_id, chat_id)
         await asyncio.sleep(0.35)
     try:
-        await bot.send_message(chat_id, _format_board(rows, quiz_id, total, final=True))
+        await bot.send_message(
+            chat_id,
+            _format_board(rows, quiz_id, total, final=True),
+            message_thread_id=thread_id,
+        )
     except Exception:
         log.exception("could not send final leaderboard to %s", chat_id)
     if control_id:
@@ -898,7 +914,10 @@ async def group_quiz_stop(message: Message, session):
     uid = message.from_user.id if message.from_user else 0
     if not (_anonymous_admin(message) or await is_chat_admin(message.bot, message.chat.id, uid)):
         return await message.reply("⛔ هذا الأمر لمشرفي المجموعة فقط.")
-    qs = await _latest_session(session, message.chat.id, only_active=True)
+    qs = await _latest_session(
+        session, message.chat.id, only_active=True,
+        message_thread_id=getattr(message, "message_thread_id", None),
+    )
     if qs is None:
         return await message.reply("لا يوجد اختبار نشط في هذه المجموعة.")
     await finish_session(message.bot, qs.id)
@@ -906,7 +925,10 @@ async def group_quiz_stop(message: Message, session):
 
 @router.message(Command("quizresults"), F.chat.type.in_(GROUP_TYPES))
 async def group_quiz_results(message: Message, session):
-    qs = await _latest_session(session, message.chat.id)
+    qs = await _latest_session(
+        session, message.chat.id,
+        message_thread_id=getattr(message, "message_thread_id", None),
+    )
     if qs is None:
         return await message.reply("لم يُنشر أي اختبار في هذه المجموعة بعد.")
     rows = await _leaderboard(session, qs.id)
@@ -1680,6 +1702,10 @@ async def collect_reply_text_answer(message: Message, session) -> None:
     qs = await session.get(QuizSession, session_prompt.session_id)
     if qs is None or qs.status not in {"publishing", "active"}:
         return await message.reply("انتهى هذا الاختبار.")
+    if getattr(message, "message_thread_id", None) != qs.message_thread_id:
+        return await message.reply("أرسل الإجابة داخل الموضوع الذي نُشر فيه السؤال.")
+    if qs.deadline_at and utcnow() > qs.deadline_at:
+        return await message.reply("انتهى وقت الاختبار؛ لم تُحتسب هذه الإجابة.")
     question = await session.scalar(
         select(QuizQuestion).where(
             QuizQuestion.quiz_id == qs.quiz_id,
