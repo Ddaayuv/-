@@ -186,39 +186,190 @@ def _publish_error(exc: Exception) -> str:
     return str(exc)[:200] or "خطأ غير معروف"
 
 
+async def _send_private_result(bot: Bot, attempt_id: int) -> None:
+    async with Session() as result_session:
+        attempt = await result_session.get(QuizAttempt, attempt_id)
+        if attempt is None:
+            return
+        quiz = await result_session.get(Quiz, attempt.quiz_id)
+        if quiz is None:
+            return
+        maximum = sum(float(question.points or 1) for question in quiz.questions)
+        percentage = round((float(attempt.score or 0) / maximum) * 100) if maximum else 0
+        passed = percentage >= float(quiz.passing_score or 0)
+        status_line = "✅ ناجح" if passed else "❌ لم تحقق درجة النجاح"
+        if attempt.status == "expired":
+            status_line += " — انتهى الوقت"
+        body = (
+            f"🏁 <b>انتهى الاختبار: {esc(quiz.title)}</b>\n\n"
+            f"الدرجة: <b>{float(attempt.score or 0):g}</b> من <b>{maximum:g}</b>\n"
+            f"النسبة: <b>{percentage}%</b>\n"
+            f"الإجابات الصحيحة: <b>{attempt.correct_count}</b> من <b>{attempt.total_questions}</b>\n"
+            f"درجة النجاح: <b>{float(quiz.passing_score or 0):g}%</b>\n"
+            f"<b>{status_line}</b>"
+        )
+        user_id = attempt.user_telegram_id
+    try:
+        await bot.send_message(user_id, body)
+    except Exception:
+        log.exception("Could not send final quiz result to user=%s", user_id)
+
+
+async def _complete_private_attempt(bot: Bot, attempt_id: int, *, expired: bool = False) -> None:
+    async with Session() as result_session:
+        attempt = await result_session.get(QuizAttempt, attempt_id)
+        if attempt is None or attempt.status not in {"active", "partial"}:
+            return
+        attempt.status = "expired" if expired else "completed"
+        attempt.finished_at = utcnow()
+        await result_session.commit()
+    await _send_private_result(bot, attempt_id)
+
+
+async def _expire_attempt_after(bot: Bot, attempt_id: int, delay: int) -> None:
+    try:
+        await asyncio.sleep(max(0, delay))
+        await _complete_private_attempt(bot, attempt_id, expired=True)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        log.exception("Quiz attempt timeout task failed for attempt=%s", attempt_id)
+
+
 async def _publish_attempt(bot: Bot, session, quiz: Quiz, user_id: int) -> None:
-    """Private chat: the student solves the quiz here and gets a score."""
+    """Start a private attempt with native polls and reply-based text questions."""
+    if not quiz.questions:
+        await bot.send_message(user_id, "هذا الاختبار لا يحتوي أسئلة.")
+        return
+
+    used = await session.scalar(
+        select(func.count(QuizAttempt.id)).where(
+            QuizAttempt.quiz_id == quiz.id,
+            QuizAttempt.user_telegram_id == user_id,
+        )
+    ) or 0
+    if quiz.max_attempts is not None and used >= quiz.max_attempts:
+        await bot.send_message(
+            user_id,
+            f"⛔ استنفدت محاولاتك المسموحة لهذا الاختبار ({quiz.max_attempts}).",
+        )
+        return
+
+    active = await session.scalar(
+        select(QuizAttempt.id).where(
+            QuizAttempt.quiz_id == quiz.id,
+            QuizAttempt.user_telegram_id == user_id,
+            QuizAttempt.status.in_(("active", "partial")),
+        ).limit(1)
+    )
+    if active:
+        await bot.send_message(
+            user_id,
+            f"لديك محاولة غير مكتملة لهذا الاختبار (#{active}). أكملها أولاً.",
+        )
+        return
+
     questions = list(quiz.questions)
-    attempt = QuizAttempt(quiz_id=quiz.id, user_telegram_id=user_id, total_questions=len(questions),
-                          answered_count=0, correct_count=0, status="active")
+    if quiz.randomize_questions:
+        random.shuffle(questions)
+    deadline = (
+        utcnow() + timedelta(seconds=quiz.time_limit_seconds)
+        if quiz.time_limit_seconds else None
+    )
+    attempt = QuizAttempt(
+        quiz_id=quiz.id,
+        user_telegram_id=user_id,
+        total_questions=len(questions),
+        answered_count=0,
+        correct_count=0,
+        score=0.0,
+        status="active",
+        deadline_at=deadline,
+    )
     session.add(attempt)
     await session.commit()
+
     sent = 0
     failure = ""
     for question in questions:
         try:
-            message = await _send_poll(bot, user_id, _poll_payload(question, len(questions), anonymous=False))
-            session.add(QuizPoll(poll_id=message.poll.id, attempt_id=attempt.id,
-                                 question_number=question.number, correct_option_index=question.correct_option_index))
+            if question.image_file_id:
+                await bot.send_photo(
+                    user_id,
+                    question.image_file_id,
+                    caption=f"🖼 <b>صورة السؤال {question.number}</b>",
+                )
+            if question.question_type == "text":
+                prompt = await bot.send_message(
+                    user_id,
+                    f"✍️ <b>السؤال {question.number}/{len(questions)}</b>\n\n"
+                    f"{esc(question.question)}\n\n"
+                    "<i>أجب بالرد مباشرة على هذه الرسالة.</i>",
+                )
+                session.add(
+                    QuizPrompt(
+                        attempt_id=attempt.id,
+                        question_number=question.number,
+                        message_id=prompt.message_id,
+                    )
+                )
+            else:
+                payload = _poll_payload(
+                    question,
+                    len(questions),
+                    anonymous=False,
+                    randomize_options=quiz.randomize_options,
+                )
+                poll_message = await _send_poll(bot, user_id, payload)
+                session.add(
+                    QuizPoll(
+                        poll_id=poll_message.poll.id,
+                        attempt_id=attempt.id,
+                        question_number=question.number,
+                        correct_option_index=payload["correct_option_id"],
+                    )
+                )
             await session.commit()
             sent += 1
         except Exception as exc:
             await session.rollback()
             failure = _publish_error(exc)
-            log.exception("Failed to send quiz question to user=%s", user_id)
+            log.exception(
+                "Failed to send quiz question=%s to user=%s",
+                question.number,
+                user_id,
+            )
             break
         await asyncio.sleep(PRIVATE_DELAY)
+
     if sent != len(questions):
         attempt = await session.get(QuizAttempt, attempt.id)
         attempt.total_questions = sent
         attempt.status = "partial" if sent else "failed"
         await session.commit()
         if not sent:
-            await bot.send_message(user_id, f"تعذّر إرسال أسئلة الاختبار ({esc(failure)}). لم يتم احتساب نتيجة.")
+            await bot.send_message(
+                user_id,
+                f"تعذّر إرسال أسئلة الاختبار ({esc(failure)}). لم يتم احتساب نتيجة.",
+            )
         else:
-            await bot.send_message(user_id, f"⚠️ أُرسل {sent} من {len(questions)} سؤالاً فقط ({esc(failure)}). سأحسب نتيجتك على ما وصل.")
+            await bot.send_message(
+                user_id,
+                f"⚠️ أُرسل {sent} من {len(questions)} سؤالاً فقط ({esc(failure)}). "
+                "سيتم احتساب النتيجة على ما وصل.",
+            )
     else:
-        await bot.send_message(user_id, f"✅ بدأ الاختبار #{quiz.id}. أجب عن جميع الاستطلاعات وستظهر نتيجتك بعد آخر إجابة.")
+        await bot.send_message(
+            user_id,
+            f"✅ بدأ الاختبار #{quiz.id}. أجب عن الاستطلاعات، وأرسل إجابات الأسئلة النصية بالرد على رسائلها.",
+        )
+        if quiz.time_limit_seconds:
+            task = asyncio.create_task(
+                _expire_attempt_after(bot, attempt.id, quiz.time_limit_seconds),
+                name=f"quiz-attempt-timeout-{attempt.id}",
+            )
+            _attempt_tasks.add(task)
+            task.add_done_callback(_attempt_tasks.discard)
 
 
 # ----------------------------------------------------------------------------- publishing to groups / channels
