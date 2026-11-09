@@ -106,6 +106,15 @@ class Quiz(Base):
     owner_telegram_id: Mapped[int] = mapped_column(BigInteger, index=True)
     title: Mapped[str] = mapped_column(String(200), default="اختبار من النص")
     original_text: Mapped[str] = mapped_column(Text, default="")
+    description: Mapped[str] = mapped_column(Text, default="")
+    passing_score: Mapped[float] = mapped_column(default=50.0)
+    time_limit_seconds: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    max_attempts: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    randomize_questions: Mapped[bool] = mapped_column(Boolean, default=False)
+    randomize_options: Mapped[bool] = mapped_column(Boolean, default=False)
+    opens_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    closes_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    is_draft: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     questions: Mapped[list["QuizQuestion"]] = relationship(lazy="selectin", cascade="all, delete-orphan", order_by="QuizQuestion.number")
 
@@ -118,8 +127,13 @@ class QuizQuestion(Base):
     number: Mapped[int] = mapped_column(Integer)
     question: Mapped[str] = mapped_column(Text)
     options_json: Mapped[str] = mapped_column(Text)
-    correct_option_index: Mapped[int] = mapped_column(Integer)
+    correct_option_index: Mapped[int] = mapped_column(Integer, default=-1)
     explanation: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    question_type: Mapped[str] = mapped_column(String(24), default="mcq")
+    points: Mapped[float] = mapped_column(default=1.0)
+    image_file_id: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    correct_text_answer: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    time_limit_seconds: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
 
 
 class QuizAttempt(Base):
@@ -131,6 +145,8 @@ class QuizAttempt(Base):
     answered_count: Mapped[int] = mapped_column(Integer, default=0)
     correct_count: Mapped[int] = mapped_column(Integer, default=0)
     status: Mapped[str] = mapped_column(String(20), default="active")
+    score: Mapped[float] = mapped_column(default=0.0)
+    deadline_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     started_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 
@@ -150,9 +166,21 @@ class QuizResponse(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     attempt_id: Mapped[int] = mapped_column(ForeignKey("quiz_attempts.id", ondelete="CASCADE"), index=True)
     question_number: Mapped[int] = mapped_column(Integer)
-    selected_option_index: Mapped[int] = mapped_column(Integer)
+    selected_option_index: Mapped[int] = mapped_column(Integer, default=-1)
     is_correct: Mapped[bool] = mapped_column(Boolean, default=False)
+    answer_text: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    points_awarded: Mapped[float] = mapped_column(default=0.0)
     answered_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+class QuizPrompt(Base):
+    """A private-chat text question waiting for the learner's reply."""
+    __tablename__ = "quiz_prompts"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    attempt_id: Mapped[int] = mapped_column(ForeignKey("quiz_attempts.id", ondelete="CASCADE"), index=True)
+    question_number: Mapped[int] = mapped_column(Integer)
+    message_id: Mapped[int] = mapped_column(BigInteger, unique=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
 
 class QuizSession(Base):
@@ -162,6 +190,7 @@ class QuizSession(Base):
     quiz_id: Mapped[int] = mapped_column(ForeignKey("quizzes.id", ondelete="CASCADE"), index=True)
     chat_id: Mapped[int] = mapped_column(BigInteger, index=True)
     chat_title: Mapped[str] = mapped_column(String(200), default="")
+    message_thread_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
     started_by: Mapped[int] = mapped_column(BigInteger, default=0)
     total_questions: Mapped[int] = mapped_column(Integer, default=0)
     status: Mapped[str] = mapped_column(String(20), default="publishing")
@@ -223,6 +252,55 @@ def _sync_migrations(conn):
     question_columns={c["name"] for c in inspector.get_columns("quiz_questions")} if inspector.has_table("quiz_questions") else set()
     if question_columns and "explanation" not in question_columns: conn.execute(text("ALTER TABLE quiz_questions ADD COLUMN explanation TEXT"))
     return add_practical,add_mode
+def _sync_quiz_migrations(conn):
+    """Additive, repeatable migrations for the expanded quiz schema."""
+    inspector = inspect(conn)
+    dialect = conn.dialect.name
+    bool_default = "FALSE" if dialect == "postgresql" else "0"
+
+    additions = {
+        "quizzes": {
+            "description": "TEXT NOT NULL DEFAULT ''",
+            "passing_score": "FLOAT NOT NULL DEFAULT 50.0",
+            "time_limit_seconds": "INTEGER",
+            "max_attempts": "INTEGER",
+            "randomize_questions": f"BOOLEAN NOT NULL DEFAULT {bool_default}",
+            "randomize_options": f"BOOLEAN NOT NULL DEFAULT {bool_default}",
+            "opens_at": "DATETIME",
+            "closes_at": "DATETIME",
+            "is_draft": f"BOOLEAN NOT NULL DEFAULT {bool_default}",
+        },
+        "quiz_questions": {
+            "question_type": "VARCHAR(24) NOT NULL DEFAULT 'mcq'",
+            "points": "FLOAT NOT NULL DEFAULT 1.0",
+            "image_file_id": "TEXT",
+            "correct_text_answer": "TEXT",
+            "time_limit_seconds": "INTEGER",
+        },
+        "quiz_attempts": {
+            "score": "FLOAT NOT NULL DEFAULT 0.0",
+            "deadline_at": "DATETIME",
+        },
+        "quiz_responses": {
+            "answer_text": "TEXT",
+            "points_awarded": "FLOAT NOT NULL DEFAULT 0.0",
+        },
+        "quiz_sessions": {
+            "message_thread_id": "BIGINT",
+        },
+    }
+    for table_name, columns in additions.items():
+        if not inspector.has_table(table_name):
+            continue
+        current = {column["name"] for column in inspector.get_columns(table_name)}
+        for column_name, definition in columns.items():
+            if column_name not in current:
+                conn.execute(text(
+                    f"ALTER TABLE {table_name} ADD COLUMN {column_name} {definition}"
+                ))
+                current.add(column_name)
+
+
 def snapshot_sqlite() -> str | None:
     """Copy the SQLite file next to itself before migrations so nothing can be lost silently."""
     if not settings.db_url.startswith("sqlite"): return None
@@ -239,7 +317,7 @@ async def db_counts(session) -> dict:
     return {"users":await session.scalar(select(func.count(User.id))) or 0,"items":await session.scalar(select(func.count(Item.id))) or 0,"attachments":await session.scalar(select(func.count(Attachment.id))) or 0}
 async def init_db():
     snapshot_sqlite()
-    async with engine.begin() as conn: await conn.run_sync(Base.metadata.create_all); added_practical,added_mode=await conn.run_sync(_sync_migrations)
+    async with engine.begin() as conn: await conn.run_sync(Base.metadata.create_all); added_practical,added_mode=await conn.run_sync(_sync_migrations); await conn.run_sync(_sync_quiz_migrations)
     async with Session() as s:
         if not await s.scalar(select(Section.id).limit(1)):
             for i,(slug,ar,em,al) in enumerate(SECTIONS): s.add(Section(slug=slug,name_ar=ar,emoji=em,aliases=al,sort_order=i))
