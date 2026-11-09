@@ -160,6 +160,7 @@ class QuizPoll(Base):
     attempt_id: Mapped[int] = mapped_column(ForeignKey("quiz_attempts.id", ondelete="CASCADE"), index=True)
     question_number: Mapped[int] = mapped_column(Integer)
     correct_option_index: Mapped[int] = mapped_column(Integer)
+    message_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
 
@@ -310,6 +311,7 @@ def _sync_quiz_migrations(conn):
         },
         "quiz_polls": {
             "created_at": "TIMESTAMP" if dialect == "postgresql" else "DATETIME",
+            "message_id": "BIGINT",
         },
         "quiz_session_polls": {
             "created_at": "TIMESTAMP" if dialect == "postgresql" else "DATETIME",
