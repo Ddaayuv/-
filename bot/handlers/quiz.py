@@ -444,6 +444,10 @@ async def _publish_to_chat(bot: Bot, quiz_id: int, chat_id: int, kind: str, titl
                 started_by=started_by,
                 total_questions=len(questions),
                 status="publishing",
+                deadline_at=(
+                    utcnow() + timedelta(seconds=quiz.time_limit_seconds)
+                    if quiz.time_limit_seconds else None
+                ),
             )
             session.add(qs)
             await session.commit()
@@ -523,6 +527,14 @@ async def _publish_to_chat(bot: Bot, quiz_id: int, chat_id: int, kind: str, titl
                 )
                 qs.control_message_id = control.message_id
                 await session.commit()
+                if qs.deadline_at:
+                    delay = max(0, int((qs.deadline_at - utcnow()).total_seconds()))
+                    timer_task = asyncio.create_task(
+                        _expire_group_session(bot, qs.id, delay),
+                        name=f"quiz-group-timeout-{qs.id}",
+                    )
+                    _tasks.add(timer_task)
+                    timer_task.add_done_callback(_tasks.discard)
 
         await audit(
             session,
@@ -578,6 +590,16 @@ async def _latest_session(session, chat_id: int, only_active: bool = False):
     if only_active:
         q = q.where(QuizSession.status.in_(("publishing", "active")))
     return await session.scalar(q.order_by(QuizSession.id.desc()))
+
+
+async def _expire_group_session(bot: Bot, session_id: int, delay: int) -> None:
+    try:
+        await asyncio.sleep(max(0, delay))
+        await finish_session(bot, session_id)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        log.exception("Group quiz timeout task failed for session=%s", session_id)
 
 
 async def finish_session(bot: Bot, session_id: int) -> bool:
@@ -1208,7 +1230,11 @@ async def _record_private_answer(session, bot: Bot, poll: QuizPoll, voter, chose
         )
         return
 
-    is_correct = chosen == poll.correct_option_index
+    question_time_expired = bool(
+        question.time_limit_seconds
+        and utcnow() > poll.created_at + timedelta(seconds=question.time_limit_seconds)
+    )
+    is_correct = chosen == poll.correct_option_index and not question_time_expired
     points = float(question.points or 1) if is_correct else 0.0
     session.add(
         QuizResponse(
@@ -1258,7 +1284,14 @@ async def _record_session_answer(session, sp: QuizSessionPoll, voter, chosen: in
             QuizQuestion.number == sp.question_number,
         )
     )
-    is_correct = chosen == sp.correct_option_index
+    if qs.deadline_at and utcnow() > qs.deadline_at:
+        return
+    question_time_expired = bool(
+        question is not None
+        and question.time_limit_seconds
+        and utcnow() > sp.created_at + timedelta(seconds=question.time_limit_seconds)
+    )
+    is_correct = chosen == sp.correct_option_index and not question_time_expired
     points = float(question.points or 1) if question is not None and is_correct else 0.0
     session.add(
         QuizSessionAnswer(
@@ -1329,7 +1362,14 @@ async def collect_reply_text_answer(message: Message, session) -> None:
         )
         if question is None:
             return await message.reply("تعذّر العثور على السؤال المرتبط بهذه الرسالة.")
-        is_correct = normalize(answer_text) == normalize(question.correct_text_answer or "")
+        question_time_expired = bool(
+            question.time_limit_seconds
+            and utcnow() > prompt.created_at + timedelta(seconds=question.time_limit_seconds)
+        )
+        is_correct = (
+            normalize(answer_text) == normalize(question.correct_text_answer or "")
+            and not question_time_expired
+        )
         points = float(question.points or 1) if is_correct else 0.0
         session.add(
             QuizResponse(
@@ -1374,7 +1414,16 @@ async def collect_reply_text_answer(message: Message, session) -> None:
     )
     if exists:
         return await message.reply("تم تسجيل إجابتك عن هذا السؤال سابقاً.")
-    is_correct = normalize(answer_text) == normalize(question.correct_text_answer or "")
+    if qs.deadline_at and utcnow() > qs.deadline_at:
+        return await message.reply("انتهى وقت الاختبار؛ لم تُحتسب هذه الإجابة.")
+    question_time_expired = bool(
+        question.time_limit_seconds
+        and utcnow() > session_prompt.created_at + timedelta(seconds=question.time_limit_seconds)
+    )
+    is_correct = (
+        normalize(answer_text) == normalize(question.correct_text_answer or "")
+        and not question_time_expired
+    )
     points = float(question.points or 1) if is_correct else 0.0
     session.add(
         QuizSessionAnswer(
