@@ -58,6 +58,7 @@ async def main() -> None:
             BotCommand(command="menu", description="القائمة الرئيسية"),
             BotCommand(command="search", description="بحث في المحاضرات"),
             BotCommand(command="myquizzes", description="اختباراتي المحفوظة"),
+            BotCommand(command="importquiz", description="استيراد اختبار من ملف"),
         ]
         await bot.set_my_commands(public_commands, scope=BotCommandScopeDefault())
 
