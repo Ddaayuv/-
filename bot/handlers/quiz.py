@@ -1005,50 +1005,227 @@ async def quiz_publish_go(cb: CallbackQuery, session):
 
 async def _record_private_answer(session, bot: Bot, poll: QuizPoll, voter, chosen: int) -> None:
     attempt = await session.get(QuizAttempt, poll.attempt_id)
-    if not attempt or attempt.user_telegram_id != voter.id or attempt.status not in {"active", "partial"}:
+    if (
+        not attempt
+        or attempt.user_telegram_id != voter.id
+        or attempt.status not in {"active", "partial"}
+    ):
         return
-    existing = await session.scalar(select(QuizResponse.id).where(
-        QuizResponse.attempt_id == attempt.id, QuizResponse.question_number == poll.question_number))
+    if attempt.deadline_at and utcnow() > attempt.deadline_at:
+        attempt.status = "expired"
+        attempt.finished_at = utcnow()
+        await session.commit()
+        await _send_private_result(bot, attempt.id)
+        return
+
+    existing = await session.scalar(
+        select(QuizResponse.id).where(
+            QuizResponse.attempt_id == attempt.id,
+            QuizResponse.question_number == poll.question_number,
+        )
+    )
     if existing:
         return
-    session.add(QuizResponse(attempt_id=attempt.id, question_number=poll.question_number,
-                             selected_option_index=chosen, is_correct=chosen == poll.correct_option_index))
+    question = await session.scalar(
+        select(QuizQuestion).where(
+            QuizQuestion.quiz_id == attempt.quiz_id,
+            QuizQuestion.number == poll.question_number,
+        )
+    )
+    if question is None:
+        log.error(
+            "Question not found for quiz attempt=%s question=%s",
+            attempt.id,
+            poll.question_number,
+        )
+        return
+
+    is_correct = chosen == poll.correct_option_index
+    points = float(question.points or 1) if is_correct else 0.0
+    session.add(
+        QuizResponse(
+            attempt_id=attempt.id,
+            question_number=poll.question_number,
+            selected_option_index=chosen,
+            is_correct=is_correct,
+            points_awarded=points,
+        )
+    )
     try:
         await session.flush()
     except IntegrityError:
         await session.rollback()
         return
-    await session.execute(update(QuizAttempt).where(
-        QuizAttempt.id == attempt.id, QuizAttempt.status.in_(["active", "partial"])
-    ).values(answered_count=QuizAttempt.answered_count + 1,
-             correct_count=QuizAttempt.correct_count + (1 if chosen == poll.correct_option_index else 0))
-        .execution_options(synchronize_session=False))
+
+    await session.execute(
+        update(QuizAttempt)
+        .where(
+            QuizAttempt.id == attempt.id,
+            QuizAttempt.status.in_(["active", "partial"]),
+        )
+        .values(
+            answered_count=QuizAttempt.answered_count + 1,
+            correct_count=QuizAttempt.correct_count + (1 if is_correct else 0),
+            score=QuizAttempt.score + points,
+        )
+        .execution_options(synchronize_session=False)
+    )
     await session.refresh(attempt)
     done = attempt.total_questions > 0 and attempt.answered_count == attempt.total_questions
     if done:
         attempt.status = "completed"
         attempt.finished_at = utcnow()
-    score, total = attempt.correct_count, attempt.total_questions
     await session.commit()
     if done:
-        pct = round(score * 100 / total) if total else 0
-        try:
-            await bot.send_message(voter.id, f"🏁 <b>انتهى الاختبار</b>\n\n✅ الصحيحة: <b>{score}</b> من <b>{total}</b>\n📊 النتيجة: <b>{pct}%</b>")
-        except Exception:
-            log.exception("Could not send test result to user=%s", voter.id)
+        await _send_private_result(bot, attempt.id)
 
 
 async def _record_session_answer(session, sp: QuizSessionPoll, voter, chosen: int) -> None:
     qs = await session.get(QuizSession, sp.session_id)
     if qs is None or qs.status not in {"publishing", "active"}:
         return
-    session.add(QuizSessionAnswer(session_id=qs.id, user_telegram_id=voter.id, user_name=(voter.full_name or "")[:200],
-                                  question_number=sp.question_number, selected_option_index=chosen,
-                                  is_correct=chosen == sp.correct_option_index))
+    question = await session.scalar(
+        select(QuizQuestion).where(
+            QuizQuestion.quiz_id == qs.quiz_id,
+            QuizQuestion.number == sp.question_number,
+        )
+    )
+    is_correct = chosen == sp.correct_option_index
+    points = float(question.points or 1) if question is not None and is_correct else 0.0
+    session.add(
+        QuizSessionAnswer(
+            session_id=qs.id,
+            user_telegram_id=voter.id,
+            user_name=(voter.full_name or "")[:200],
+            question_number=sp.question_number,
+            selected_option_index=chosen,
+            is_correct=is_correct,
+            points_awarded=points,
+        )
+    )
     try:
         await session.commit()
-    except IntegrityError:  # same user answering the same question twice
+    except IntegrityError:
         await session.rollback()
+
+
+@router.message(F.reply_to_message, F.text)
+async def collect_reply_text_answer(message: Message, session) -> None:
+    """Record a text answer only when it replies to a tracked quiz question."""
+    reply_message = message.reply_to_message
+    prompt = await session.scalar(
+        select(QuizPrompt).where(QuizPrompt.message_id == reply_message.message_id)
+    )
+    session_prompt = None
+    if prompt is None:
+        session_prompt = await session.scalar(
+            select(QuizSessionPrompt).where(
+                QuizSessionPrompt.message_id == reply_message.message_id
+            )
+        )
+    if prompt is None and session_prompt is None:
+        raise SkipHandler
+
+    user = message.from_user
+    if user is None:
+        raise SkipHandler
+    answer_text = (message.text or "").strip()
+    if not answer_text:
+        return await message.reply("أرسل إجابة نصية.")
+    
+    if prompt is not None:
+        attempt = await session.get(QuizAttempt, prompt.attempt_id)
+        if attempt is None or attempt.user_telegram_id != user.id:
+            return await message.reply("هذه الرسالة ليست سؤالاً نصياً موجهاً إلى حسابك.")
+        if attempt.status not in {"active", "partial"}:
+            return await message.reply("انتهت هذه المحاولة ولا يمكن تسجيل إجابة جديدة.")
+        if attempt.deadline_at and utcnow() > attempt.deadline_at:
+            attempt.status = "expired"
+            attempt.finished_at = utcnow()
+            await session.commit()
+            await _send_private_result(message.bot, attempt.id)
+            return await message.reply("انتهى وقت الاختبار؛ لم تُحتسب هذه الإجابة.")
+        exists = await session.scalar(
+            select(QuizResponse.id).where(
+                QuizResponse.attempt_id == attempt.id,
+                QuizResponse.question_number == prompt.question_number,
+            )
+        )
+        if exists:
+            return await message.reply("تم تسجيل إجابتك عن هذا السؤال سابقاً.")
+        question = await session.scalar(
+            select(QuizQuestion).where(
+                QuizQuestion.quiz_id == attempt.quiz_id,
+                QuizQuestion.number == prompt.question_number,
+            )
+        )
+        if question is None:
+            return await message.reply("تعذّر العثور على السؤال المرتبط بهذه الرسالة.")
+        is_correct = normalize(answer_text) == normalize(question.correct_text_answer or "")
+        points = float(question.points or 1) if is_correct else 0.0
+        session.add(
+            QuizResponse(
+                attempt_id=attempt.id,
+                question_number=prompt.question_number,
+                selected_option_index=-1,
+                answer_text=answer_text[:2000],
+                is_correct=is_correct,
+                points_awarded=points,
+            )
+        )
+        attempt.answered_count += 1
+        attempt.correct_count += 1 if is_correct else 0
+        attempt.score = float(attempt.score or 0) + points
+        done = attempt.answered_count >= attempt.total_questions
+        if done:
+            attempt.status = "completed"
+            attempt.finished_at = utcnow()
+        await session.commit()
+        await message.reply("✅ إجابة صحيحة." if is_correct else "❌ إجابة غير صحيحة.")
+        if done:
+            await _send_private_result(message.bot, attempt.id)
+        return
+
+    qs = await session.get(QuizSession, session_prompt.session_id)
+    if qs is None or qs.status not in {"publishing", "active"}:
+        return await message.reply("انتهى هذا الاختبار.")
+    question = await session.scalar(
+        select(QuizQuestion).where(
+            QuizQuestion.quiz_id == qs.quiz_id,
+            QuizQuestion.number == session_prompt.question_number,
+        )
+    )
+    if question is None:
+        return await message.reply("تعذّر العثور على السؤال.")
+    exists = await session.scalar(
+        select(QuizSessionAnswer.id).where(
+            QuizSessionAnswer.session_id == qs.id,
+            QuizSessionAnswer.user_telegram_id == user.id,
+            QuizSessionAnswer.question_number == session_prompt.question_number,
+        )
+    )
+    if exists:
+        return await message.reply("تم تسجيل إجابتك عن هذا السؤال سابقاً.")
+    is_correct = normalize(answer_text) == normalize(question.correct_text_answer or "")
+    points = float(question.points or 1) if is_correct else 0.0
+    session.add(
+        QuizSessionAnswer(
+            session_id=qs.id,
+            user_telegram_id=user.id,
+            user_name=(user.full_name or "")[:200],
+            question_number=session_prompt.question_number,
+            selected_option_index=-1,
+            answer_text=answer_text[:2000],
+            is_correct=is_correct,
+            points_awarded=points,
+        )
+    )
+    try:
+        await session.commit()
+    except IntegrityError:
+        await session.rollback()
+        return await message.reply("تم تسجيل إجابتك عن هذا السؤال سابقاً.")
+    await message.reply("✅ إجابة صحيحة." if is_correct else "❌ إجابة غير صحيحة.")
 
 
 @router.poll_answer()
