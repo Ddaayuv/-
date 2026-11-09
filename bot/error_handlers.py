@@ -67,7 +67,7 @@ async def handle_update_error(event: Any) -> None:
             user_id,
             chat_id,
         )
-        return True
+        return
 
     if isinstance(exc, TelegramBadRequest):
         details = str(exc).lower()
@@ -119,4 +119,4 @@ async def handle_update_error(event: Any) -> None:
             await message.answer("حدث خطأ مؤقت أثناء تنفيذ الطلب. حاول مرة أخرى.")
         except Exception:
             log.debug("Could not send error notice to user", exc_info=True)
-    return True
+    return
