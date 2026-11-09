@@ -147,6 +147,8 @@ class QuizAttempt(Base):
     status: Mapped[str] = mapped_column(String(20), default="active")
     score: Mapped[float] = mapped_column(default=0.0)
     deadline_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    question_deadline_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    current_question_number: Mapped[int] = mapped_column(Integer, default=1)
     started_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 
@@ -216,9 +218,21 @@ class QuizSessionAnswer(Base):
     user_telegram_id: Mapped[int] = mapped_column(BigInteger, index=True)
     user_name: Mapped[str] = mapped_column(String(200), default="")
     question_number: Mapped[int] = mapped_column(Integer)
-    selected_option_index: Mapped[int] = mapped_column(Integer)
+    selected_option_index: Mapped[int] = mapped_column(Integer, default=-1)
     is_correct: Mapped[bool] = mapped_column(Boolean, default=False)
+    answer_text: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    points_awarded: Mapped[float] = mapped_column(default=0.0)
     answered_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+class QuizSessionPrompt(Base):
+    """Maps a text-question message in a group to its quiz session."""
+    __tablename__ = "quiz_session_prompts"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    session_id: Mapped[int] = mapped_column(ForeignKey("quiz_sessions.id", ondelete="CASCADE"), index=True)
+    question_number: Mapped[int] = mapped_column(Integer)
+    message_id: Mapped[int] = mapped_column(BigInteger, unique=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
 
 class QuizTarget(Base):
@@ -266,8 +280,8 @@ def _sync_quiz_migrations(conn):
             "max_attempts": "INTEGER",
             "randomize_questions": f"BOOLEAN NOT NULL DEFAULT {bool_default}",
             "randomize_options": f"BOOLEAN NOT NULL DEFAULT {bool_default}",
-            "opens_at": "DATETIME",
-            "closes_at": "DATETIME",
+            "opens_at": "TIMESTAMP" if dialect == "postgresql" else "DATETIME",
+            "closes_at": "TIMESTAMP" if dialect == "postgresql" else "DATETIME",
             "is_draft": f"BOOLEAN NOT NULL DEFAULT {bool_default}",
         },
         "quiz_questions": {
@@ -279,7 +293,9 @@ def _sync_quiz_migrations(conn):
         },
         "quiz_attempts": {
             "score": "FLOAT NOT NULL DEFAULT 0.0",
-            "deadline_at": "DATETIME",
+            "deadline_at": "TIMESTAMP" if dialect == "postgresql" else "DATETIME",
+            "question_deadline_at": "TIMESTAMP" if dialect == "postgresql" else "DATETIME",
+            "current_question_number": "INTEGER NOT NULL DEFAULT 1",
         },
         "quiz_responses": {
             "answer_text": "TEXT",
@@ -287,6 +303,10 @@ def _sync_quiz_migrations(conn):
         },
         "quiz_sessions": {
             "message_thread_id": "BIGINT",
+        },
+        "quiz_session_answers": {
+            "answer_text": "TEXT",
+            "points_awarded": "FLOAT NOT NULL DEFAULT 0.0",
         },
     }
     for table_name, columns in additions.items():
