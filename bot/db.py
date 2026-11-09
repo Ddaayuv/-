@@ -160,6 +160,7 @@ class QuizPoll(Base):
     attempt_id: Mapped[int] = mapped_column(ForeignKey("quiz_attempts.id", ondelete="CASCADE"), index=True)
     question_number: Mapped[int] = mapped_column(Integer)
     correct_option_index: Mapped[int] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
 
 class QuizResponse(Base):
@@ -197,6 +198,7 @@ class QuizSession(Base):
     total_questions: Mapped[int] = mapped_column(Integer, default=0)
     status: Mapped[str] = mapped_column(String(20), default="publishing")
     control_message_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    deadline_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     started_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 
@@ -208,6 +210,7 @@ class QuizSessionPoll(Base):
     question_number: Mapped[int] = mapped_column(Integer)
     correct_option_index: Mapped[int] = mapped_column(Integer)
     message_id: Mapped[int] = mapped_column(BigInteger)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
 
 class QuizSessionAnswer(Base):
@@ -303,6 +306,13 @@ def _sync_quiz_migrations(conn):
         },
         "quiz_sessions": {
             "message_thread_id": "BIGINT",
+            "deadline_at": "TIMESTAMP" if dialect == "postgresql" else "DATETIME",
+        },
+        "quiz_polls": {
+            "created_at": "TIMESTAMP" if dialect == "postgresql" else "DATETIME",
+        },
+        "quiz_session_polls": {
+            "created_at": "TIMESTAMP" if dialect == "postgresql" else "DATETIME",
         },
         "quiz_session_answers": {
             "answer_text": "TEXT",
