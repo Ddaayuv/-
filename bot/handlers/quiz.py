@@ -879,7 +879,13 @@ async def group_quiz(message: Message, command: CommandObject, session):
             return await message.reply(_problems_text(parsed)[:3900])
         quiz = await _save_quiz(session, uid, source, parsed)
     chat = message.chat
-    error = await _launch_publish(bot, quiz.id, chat.id, "group", chat.title or "", uid, chat.id)
+    if quiz.is_draft:
+        return await message.reply("هذا الاختبار مسودة ولا يمكن تشغيله حتى يتم حفظه كاختبار.")
+    thread_id = getattr(message, "message_thread_id", None)
+    error = await _launch_publish(
+        bot, quiz.id, chat.id, "group", chat.title or "", uid, chat.id,
+        message_thread_id=thread_id,
+    )
     if error:
         return await message.reply(error)
     minutes = max(1, round(len(quiz.questions) * SHARED_DELAY / 60))
@@ -1345,6 +1351,9 @@ async def _target_for(cb: CallbackQuery, session) -> tuple[Quiz, QuizTarget] | N
     if target is None or not target.is_active:
         await cb.answer("هذه الوجهة غير متاحة.", show_alert=True)
         return None
+    if quiz.is_draft:
+        await cb.answer("هذه مسودة. احفظها كاختبار أولاً قبل النشر.", show_alert=True)
+        return None
     if not await is_chat_admin(cb.bot, target.chat_id, cb.from_user.id):
         await cb.answer("⛔ لست مشرفاً في هذه الوجهة.", show_alert=True)
         return None
@@ -1358,12 +1367,93 @@ async def quiz_publish_confirm(cb: CallbackQuery, session):
         return
     quiz, target = found
     kind_text = "قناة (مجهول الهوية، بلا ترتيب)" if target.kind == "channel" else "مجموعة (مع ترتيب للمشاركين)"
+    rows = [
+        [InlineKeyboardButton(text="✅ نشر في المحادثة العامة", callback_data=f"quiz:go:{quiz.id}:{target.id}")],
+    ]
+    if target.kind in GROUP_TYPES:
+        rows.insert(0, [
+            InlineKeyboardButton(
+                text="🧵 النشر داخل موضوع محدد",
+                callback_data=f"quiz:thread:{quiz.id}:{target.id}",
+            )
+        ])
+    rows.append([
+        InlineKeyboardButton(text="⬅️ رجوع", callback_data=f"quiz:pick:{quiz.id}")
+    ])
     await cb.answer()
     await cb.message.edit_text(
-        f"📢 نشر الاختبار #{quiz.id} ({len(quiz.questions)} سؤال) في:\n<b>{esc(target.title)}</b> — {kind_text}\n\nهل تؤكد؟",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="✅ نعم، انشر", callback_data=f"quiz:go:{quiz.id}:{target.id}"),
-             InlineKeyboardButton(text="⬅️ رجوع", callback_data=f"quiz:pick:{quiz.id}")]]))
+        f"📢 نشر الاختبار #{quiz.id} ({len(quiz.questions)} سؤال) في:\n"
+        f"<b>{esc(target.title)}</b> — {kind_text}\n\n"
+        "اختر مكان النشر:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+
+
+@router.callback_query(F.data.startswith("quiz:thread:"))
+async def quiz_topic_start(cb: CallbackQuery, state: FSMContext, session):
+    found = await _target_for(cb, session)
+    if found is None:
+        return
+    quiz, target = found
+    try:
+        chat = await cb.bot.get_chat(target.chat_id)
+    except TelegramAPIError:
+        return await cb.answer("تعذر فحص إعدادات المجموعة. حاول لاحقاً.", show_alert=True)
+    if not getattr(chat, "is_forum", False):
+        return await cb.answer("هذه المجموعة لا تستخدم المواضيع (Forum Topics).", show_alert=True)
+    await state.set_state(QuizInput.add_thread)
+    await state.update_data(
+        topic_quiz_id=quiz.id,
+        topic_target_id=target.id,
+        topic_chat_id=target.chat_id,
+        topic_title=target.title,
+    )
+    await cb.message.answer(
+        "🧵 أرسل معرّف الموضوع (message_thread_id) الذي تريد النشر بداخله.\n"
+        "يمكنك الحصول عليه من بيانات رسالة داخل الموضوع أو من بوت إدارة المجموعة.\n"
+        "أرسل /cancel للإلغاء."
+    )
+    await cb.answer()
+
+
+@router.message(QuizInput.add_thread)
+async def quiz_topic_save(message: Message, state: FSMContext, session):
+    raw = (message.text or "").strip()
+    if raw.lower() == "/cancel":
+        await state.clear()
+        return await message.answer("تم إلغاء اختيار الموضوع.")
+    try:
+        thread_id = int(raw)
+        if thread_id <= 0:
+            raise ValueError
+    except ValueError:
+        return await message.answer("أرسل معرّف موضوع رقمي صحيحاً أكبر من صفر، أو /cancel.")
+    data = await state.get_data()
+    quiz_id = data.get("topic_quiz_id")
+    target_id = data.get("topic_target_id")
+    quiz = await session.get(Quiz, int(quiz_id)) if quiz_id else None
+    target = await session.get(QuizTarget, int(target_id)) if target_id else None
+    if (
+        quiz is None or target is None or not target.is_active
+        or quiz.owner_telegram_id != message.from_user.id
+    ):
+        await state.clear()
+        return await message.answer("لم تعد وجهة النشر أو صلاحية الاختبار متاحة.")
+    if not await is_chat_admin(message.bot, target.chat_id, message.from_user.id):
+        await state.clear()
+        return await message.answer("⛔ يجب أن تكون مشرفاً في هذه المجموعة.")
+    error = await _launch_publish(
+        message.bot, quiz.id, target.chat_id, target.kind, target.title,
+        message.from_user.id, message.from_user.id,
+        message_thread_id=thread_id,
+    )
+    if error:
+        return await message.answer(error)
+    await state.clear()
+    await message.answer(
+        f"⏳ بدأ نشر الاختبار #{quiz.id} داخل الموضوع {thread_id} في "
+        f"<b>{esc(target.title)}</b>."
+    )
 
 
 @router.callback_query(F.data.startswith("quiz:go:"))
@@ -1372,7 +1462,10 @@ async def quiz_publish_go(cb: CallbackQuery, session):
     if found is None:
         return
     quiz, target = found
-    error = await _launch_publish(cb.bot, quiz.id, target.chat_id, target.kind, target.title, cb.from_user.id, cb.from_user.id)
+    error = await _launch_publish(
+        cb.bot, quiz.id, target.chat_id, target.kind, target.title,
+        cb.from_user.id, cb.from_user.id,
+    )
     if error:
         return await cb.answer(error[:190], show_alert=True)
     seconds = round(len(quiz.questions) * SHARED_DELAY)
