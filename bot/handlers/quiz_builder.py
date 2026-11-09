@@ -717,6 +717,14 @@ async def show_my_quizzes(callback: CallbackQuery) -> None:
     await callback.answer()
 
 
+@router.callback_query(F.data == "quiz:import")
+async def start_quiz_import(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    await state.set_state(QuizBuild.import_file)
+    await callback.message.answer("أرسل ملف JSON أو CSV أو XLSX أو TXT لاستيراد الأسئلة.")
+    await callback.answer()
+
+
 @router.callback_query(F.data == "qbuild:import")
 async def start_import_callback(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(QuizBuild.import_file)
