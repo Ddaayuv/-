@@ -11,7 +11,7 @@ from .backup import backup_loop
 from .config import runtime, settings
 from .db import Session, db_counts, init_db
 from .error_handlers import handle_update_error
-from .handlers import admin, fallback, quiz, user
+from .handlers import admin, fallback, quiz, quiz_builder, user
 from .logging_setup import configure_logging
 from .middlewares import DbMiddleware, MembershipMiddleware, ThrottleMiddleware
 
@@ -48,6 +48,7 @@ async def main() -> None:
 
         # The fallback router must remain last so existing handlers take priority.
         dp.include_router(admin.router)
+        dp.include_router(quiz_builder.router)
         dp.include_router(quiz.router)
         dp.include_router(user.router)
         dp.include_router(fallback.router)
