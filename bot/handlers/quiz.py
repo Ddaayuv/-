@@ -50,6 +50,9 @@ class QuizInput(StatesGroup):
     confirm = State()
     add_target = State()
 
+class QuizManage(StatesGroup):
+    rename = State()
+
 
 # ----------------------------------------------------------------------------- texts / keyboards
 
@@ -756,13 +759,178 @@ async def quiz_legacy_start(cb: CallbackQuery, state: FSMContext):
 
 @router.message(Command("myquizzes"), F.chat.type == "private")
 async def my_quizzes(message: Message, session):
-    quizzes = (await session.scalars(select(Quiz).where(Quiz.owner_telegram_id == message.from_user.id)
-                                     .order_by(Quiz.created_at.desc()).limit(10))).all()
+    quizzes = (await session.scalars(
+        select(Quiz)
+        .where(Quiz.owner_telegram_id == message.from_user.id)
+        .order_by(Quiz.created_at.desc())
+        .limit(10)
+    )).all()
     if not quizzes:
         return await message.answer("ما عندك اختبارات محفوظة بعد. اضغط «🤖 إنشاء اختبار».")
-    rows = [[InlineKeyboardButton(text=f"🔁 #{q.id} {q.title[:20]} ({len(q.questions)})", callback_data=f"quiz:retry:{q.id}"),
-             InlineKeyboardButton(text="📢 نشر", callback_data=f"quiz:pick:{q.id}")] for q in quizzes]
-    await message.answer("📚 اختباراتك المحفوظة:", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    rows = []
+    for quiz in quizzes:
+        state_label = "📝 مسودة" if quiz.is_draft else "✅ محفوظ"
+        rows.append([
+            InlineKeyboardButton(
+                text=f"{state_label} #{quiz.id} {quiz.title[:22]} ({len(quiz.questions)})",
+                callback_data=f"quiz:pick:{quiz.id}",
+            )
+        ])
+        rows.append([
+            InlineKeyboardButton(text="▶️ حلّ", callback_data=f"quiz:retry:{quiz.id}"),
+            InlineKeyboardButton(text="📢 نشر", callback_data=f"quiz:pick:{quiz.id}"),
+        ])
+        rows.append([
+            InlineKeyboardButton(text="✏️ تعديل العنوان", callback_data=f"quiz:manage:edit:{quiz.id}"),
+            InlineKeyboardButton(text="🔁 نسخ", callback_data=f"quiz:manage:clone:{quiz.id}"),
+            InlineKeyboardButton(text="🗑 حذف", callback_data=f"quiz:manage:delete:{quiz.id}"),
+        ])
+        rows.append([
+            InlineKeyboardButton(text="🧩 تعديل الأسئلة", callback_data=f"qbuild:resume:{quiz.id}")
+        ])
+    await message.answer("📚 اختباراتك المحفوظة والمسودات:", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+@router.callback_query(F.data.startswith("quiz:manage:edit:"))
+async def quiz_rename_start(callback: CallbackQuery, state: FSMContext, session):
+    try:
+        quiz_id = int(callback.data.rsplit(":", 1)[1])
+    except ValueError:
+        return await callback.answer("رقم الاختبار غير صحيح.", show_alert=True)
+    quiz = await session.get(Quiz, quiz_id)
+    if quiz is None or quiz.owner_telegram_id != callback.from_user.id:
+        return await callback.answer("هذا الاختبار غير متاح لحسابك.", show_alert=True)
+    await state.set_state(QuizManage.rename)
+    await state.update_data(rename_quiz_id=quiz.id)
+    await callback.message.answer(
+        f"✏️ أرسل العنوان الجديد للاختبار الحالي: <b>{esc(quiz.title)}</b>\n"
+        "أرسل /cancel للإلغاء."
+    )
+    await callback.answer()
+
+
+@router.message(QuizManage.rename)
+async def quiz_rename_save(message: Message, state: FSMContext, session):
+    if (message.text or "").strip().lower() == "/cancel":
+        await state.clear()
+        return await message.answer("تم إلغاء تعديل العنوان.")
+    title = (message.text or "").strip()
+    if not title or len(title) > 200:
+        return await message.answer("العنوان مطلوب وبحد أقصى 200 حرف.")
+    data = await state.get_data()
+    quiz_id = data.get("rename_quiz_id")
+    quiz = await session.get(Quiz, int(quiz_id)) if quiz_id else None
+    if quiz is None or quiz.owner_telegram_id != message.from_user.id:
+        await state.clear()
+        return await message.answer("الاختبار غير موجود أو لا تملك صلاحية تعديله.")
+    quiz.title = title
+    await session.commit()
+    await state.clear()
+    await message.answer(f"✅ تم تحديث عنوان الاختبار #{quiz.id}.")
+
+
+@router.callback_query(F.data.startswith("quiz:manage:clone:"))
+async def quiz_clone(callback: CallbackQuery, session):
+    try:
+        quiz_id = int(callback.data.rsplit(":", 1)[1])
+    except ValueError:
+        return await callback.answer("رقم الاختبار غير صحيح.", show_alert=True)
+    source = await session.get(Quiz, quiz_id)
+    if source is None or source.owner_telegram_id != callback.from_user.id:
+        return await callback.answer("هذا الاختبار غير متاح لحسابك.", show_alert=True)
+    clone = Quiz(
+        owner_telegram_id=callback.from_user.id,
+        title=(source.title + " — نسخة")[:200],
+        original_text=source.original_text,
+        description=source.description,
+        passing_score=source.passing_score,
+        time_limit_seconds=source.time_limit_seconds,
+        max_attempts=source.max_attempts,
+        randomize_questions=source.randomize_questions,
+        randomize_options=source.randomize_options,
+        opens_at=source.opens_at,
+        closes_at=source.closes_at,
+        is_draft=True,
+    )
+    for question in source.questions:
+        clone.questions.append(QuizQuestion(
+            number=question.number,
+            question=question.question,
+            options_json=question.options_json,
+            correct_option_index=question.correct_option_index,
+            explanation=question.explanation,
+            question_type=question.question_type,
+            points=question.points,
+            image_file_id=question.image_file_id,
+            correct_text_answer=question.correct_text_answer,
+            time_limit_seconds=question.time_limit_seconds,
+        ))
+    session.add(clone)
+    await session.commit()
+    await callback.answer("تم نسخ الاختبار ✅")
+    await callback.message.answer(
+        f"🔁 أُنشئت نسخة مسودة #{clone.id}: <b>{esc(clone.title)}</b>\n"
+        "يمكنك تعديل أسئلتها من «اختباراتي»."
+    )
+
+
+@router.callback_query(F.data.startswith("quiz:manage:delete:"))
+async def quiz_delete_start(callback: CallbackQuery, state: FSMContext, session):
+    try:
+        quiz_id = int(callback.data.rsplit(":", 1)[1])
+    except ValueError:
+        return await callback.answer("رقم الاختبار غير صحيح.", show_alert=True)
+    quiz = await session.get(Quiz, quiz_id)
+    if quiz is None or quiz.owner_telegram_id != callback.from_user.id:
+        return await callback.answer("هذا الاختبار غير متاح لحسابك.", show_alert=True)
+    active = await session.scalar(
+        select(QuizSession.id).where(
+            QuizSession.quiz_id == quiz.id,
+            QuizSession.status.in_(("publishing", "active")),
+        ).limit(1)
+    )
+    if active:
+        return await callback.answer("لا يمكن حذف الاختبار أثناء وجود جلسة نشطة.", show_alert=True)
+    await state.update_data(delete_quiz_id=quiz.id)
+    await callback.message.answer(
+        f"⚠️ هل تريد حذف الاختبار #{quiz.id} «{esc(quiz.title)}» وكل محاولاته؟",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🗑 نعم، احذف", callback_data="quiz:manage:delete_confirm")],
+            [InlineKeyboardButton(text="إلغاء", callback_data="quiz:manage:delete_cancel")],
+        ]),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "quiz:manage:delete_cancel")
+async def quiz_delete_cancel(callback: CallbackQuery, state: FSMContext):
+    await state.update_data(delete_quiz_id=None)
+    await callback.answer("تم الإلغاء")
+    await callback.message.edit_text("تم إلغاء حذف الاختبار.")
+
+
+@router.callback_query(F.data == "quiz:manage:delete_confirm")
+async def quiz_delete_confirm(callback: CallbackQuery, state: FSMContext, session):
+    data = await state.get_data()
+    quiz_id = data.get("delete_quiz_id")
+    quiz = await session.get(Quiz, int(quiz_id)) if quiz_id else None
+    if quiz is None or quiz.owner_telegram_id != callback.from_user.id:
+        await state.clear()
+        return await callback.answer("الاختبار غير موجود.", show_alert=True)
+    active = await session.scalar(
+        select(QuizSession.id).where(
+            QuizSession.quiz_id == quiz.id,
+            QuizSession.status.in_(("publishing", "active")),
+        ).limit(1)
+    )
+    if active:
+        await state.clear()
+        return await callback.answer("هناك جلسة نشطة؛ لم يتم حذف الاختبار.", show_alert=True)
+    await session.delete(quiz)
+    await session.commit()
+    await state.clear()
+    await callback.message.edit_text(f"✅ تم حذف الاختبار #{quiz_id}.")
+    await callback.answer("تم الحذف")
 
 
 @router.message(QuizInput.text)
