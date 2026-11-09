@@ -430,26 +430,79 @@ async def _publish_to_chat(bot: Bot, quiz_id: int, chat_id: int, kind: str, titl
             await bot.send_message(notify_chat_id, "❌ الاختبار غير موجود أو بلا أسئلة.")
             return
         questions = list(quiz.questions)
+        if quiz.randomize_questions:
+            random.shuffle(questions)
         qs = None
         if not is_channel:
-            qs = QuizSession(quiz_id=quiz.id, chat_id=chat_id, chat_title=title[:200], started_by=started_by,
-                             total_questions=len(questions), status="publishing")
+            qs = QuizSession(
+                quiz_id=quiz.id,
+                chat_id=chat_id,
+                chat_title=title[:200],
+                started_by=started_by,
+                total_questions=len(questions),
+                status="publishing",
+            )
             session.add(qs)
             await session.commit()
+
         sent, failure = 0, ""
         for question in questions:
             try:
-                message = await _send_poll(bot, chat_id, _poll_payload(question, len(questions), anonymous=is_channel))
-            except Exception as exc:
-                failure = _publish_error(exc)
-                log.warning("quiz publish to %s stopped at question %s: %s", chat_id, question.number, exc)
-                break
-            sent += 1
-            if qs is not None:
-                session.add(QuizSessionPoll(poll_id=message.poll.id, session_id=qs.id, question_number=question.number,
-                                            correct_option_index=question.correct_option_index, message_id=message.message_id))
+                if question.question_type == "text":
+                    if is_channel:
+                        failure = "الأسئلة النصية لا تدعم التصحيح الفردي في القنوات؛ انشر هذا الاختبار في مجموعة."
+                        break
+                    prompt = await bot.send_message(
+                        chat_id,
+                        f"✍️ <b>السؤال {question.number}/{len(questions)}</b>\n\n"
+                        f"{esc(question.question)}\n\n"
+                        "<i>أرسل إجابتك بالرد مباشرة على رسالة السؤال.</i>",
+                    )
+                    session.add(
+                        QuizSessionPrompt(
+                            session_id=qs.id,
+                            question_number=question.number,
+                            message_id=prompt.message_id,
+                        )
+                    )
+                else:
+                    if question.image_file_id:
+                        await bot.send_photo(
+                            chat_id,
+                            question.image_file_id,
+                            caption=f"🖼 <b>صورة السؤال {question.number}</b>",
+                        )
+                    payload = _poll_payload(
+                        question,
+                        len(questions),
+                        anonymous=is_channel,
+                        randomize_options=quiz.randomize_options,
+                    )
+                    poll_message = await _send_poll(bot, chat_id, payload)
+                    if qs is not None:
+                        session.add(
+                            QuizSessionPoll(
+                                poll_id=poll_message.poll.id,
+                                session_id=qs.id,
+                                question_number=question.number,
+                                correct_option_index=payload["correct_option_id"],
+                                message_id=poll_message.message_id,
+                            )
+                        )
                 await session.commit()
+                sent += 1
+            except Exception as exc:
+                await session.rollback()
+                failure = _publish_error(exc)
+                log.warning(
+                    "Quiz publish to chat=%s stopped at question %s",
+                    chat_id,
+                    question.number,
+                    exc_info=True,
+                )
+                break
             await asyncio.sleep(SHARED_DELAY)
+
         if qs is not None:
             qs.total_questions = sent
             qs.status = "active" if sent else "failed"
@@ -457,14 +510,25 @@ async def _publish_to_chat(bot: Bot, quiz_id: int, chat_id: int, kind: str, titl
             if sent:
                 control = await bot.send_message(
                     chat_id,
-                    f"🏁 <b>اختبار #{quiz.id}</b> — {sent} سؤال\nأجيبوا عن الاستطلاعات أعلاه. المشرف يضغط «إنهاء» لإعلان الترتيب.",
+                    f"🏁 <b>اختبار #{quiz.id}</b> — {sent} سؤال\n"
+                    "أجيبوا عن الاستطلاعات والأسئلة النصية بالرد على رسائلها. "
+                    "المشرف يضغط «إنهاء» لإعلان الترتيب.",
                     reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
                         InlineKeyboardButton(text="📊 الترتيب الحالي", callback_data=f"quizs:board:{qs.id}"),
-                        InlineKeyboardButton(text="🏁 إنهاء الاختبار", callback_data=f"quizs:stop:{qs.id}")]]))
+                        InlineKeyboardButton(text="🏁 إنهاء الاختبار", callback_data=f"quizs:stop:{qs.id}"),
+                    ]]),
+                )
                 qs.control_message_id = control.message_id
                 await session.commit()
-        await audit(session, started_by, "quiz_publish", f"quiz#{quiz.id} -> {chat_id} ({kind}) sent={sent}/{len(questions)}")
+
+        await audit(
+            session,
+            started_by,
+            "quiz_publish",
+            f"quiz#{quiz.id} -> {chat_id} ({kind}) sent={sent}/{len(questions)}",
+        )
         await session.commit()
+
     if sent == len(questions):
         note = "\n\nℹ️ القنوات تخفي هوية المجيبين، لذلك لا يوجد ترتيب للقنوات." if is_channel else ""
         text = f"✅ تم نشر الاختبار #{quiz_id} في «{esc(title)}» ({sent} سؤال).{note}"
@@ -475,7 +539,7 @@ async def _publish_to_chat(bot: Bot, quiz_id: int, chat_id: int, kind: str, titl
     try:
         await bot.send_message(notify_chat_id, text)
     except Exception:
-        pass
+        log.exception("Could not notify chat=%s about quiz publication result", notify_chat_id)
 
 
 # ----------------------------------------------------------------------------- leaderboard / finishing
