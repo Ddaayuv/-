@@ -41,7 +41,7 @@ PRIVATE_DELAY = 0.4   # Telegram allows ~1 message/second to one user
 SHARED_DELAY = 3.2    # ~20 messages/minute in a group or channel
 MEDALS = ["🥇", "🥈", "🥉"]
 
-_publishing: set[int] = set()          # chat ids with a publish in progress
+_publishing: set[tuple[int, int | None]] = set()  # chat id + topic id
 _tasks: set[asyncio.Task] = set()      # keep references so tasks are not garbage collected
 _attempt_tasks: set[asyncio.Task] = set()
 
@@ -50,6 +50,7 @@ class QuizInput(StatesGroup):
     text = State()
     confirm = State()
     add_target = State()
+    add_thread = State()
 
 class QuizManage(StatesGroup):
     rename = State()
@@ -516,50 +517,87 @@ async def is_chat_admin(bot: Bot, chat_id: int, user_id: int) -> bool:
     return status_of(member) in {"creator", "administrator"}
 
 
-async def _launch_publish(bot: Bot, quiz_id: int, chat_id: int, kind: str, title: str,
-                          started_by: int, notify_chat_id: int) -> str | None:
-    """Starts publishing in the background. Returns an error text if it cannot start."""
-    if chat_id in _publishing:
-        return "⏳ هناك نشر جارٍ الآن في هذه الوجهة. انتظر حتى ينتهي."
+async def _launch_publish(
+    bot: Bot,
+    quiz_id: int,
+    chat_id: int,
+    kind: str,
+    title: str,
+    started_by: int,
+    notify_chat_id: int,
+    *,
+    message_thread_id: int | None = None,
+) -> str | None:
+    """Start publication in a chat or a specific forum topic."""
+    publish_key = (chat_id, message_thread_id)
+    if publish_key in _publishing:
+        return "⏳ يوجد نشر جارٍ في هذا الموضوع. انتظر حتى ينتهي."
     if kind != "channel":
-        async with Session() as s:
-            active = await s.scalar(select(QuizSession).where(
-                QuizSession.chat_id == chat_id, QuizSession.status.in_(("publishing", "active"))
-            ).order_by(QuizSession.id.desc()))
+        async with Session() as db_session:
+            active = await db_session.scalar(
+                select(QuizSession).where(
+                    QuizSession.chat_id == chat_id,
+                    QuizSession.message_thread_id == message_thread_id,
+                    QuizSession.status.in_(("publishing", "active")),
+                ).order_by(QuizSession.id.desc())
+            )
             if active:
                 limit = timedelta(hours=1) if active.status == "publishing" else timedelta(hours=24)
                 if utcnow() - active.started_at > limit:
                     active.status, active.finished_at = "closed", utcnow()
-                    await s.commit()
+                    await db_session.commit()
                 else:
-                    return f"يوجد اختبار نشط في هذه المجموعة (#{active.quiz_id}). أنهِه أولاً بالأمر /quizstop"
-    _publishing.add(chat_id)
-    task = asyncio.create_task(_publish_task(bot, quiz_id, chat_id, kind, title, started_by, notify_chat_id))
+                    return (
+                        f"يوجد اختبار نشط في هذا الموضوع (#{active.quiz_id}). "
+                        "أنهِه أولاً بالأمر /quizstop"
+                    )
+    _publishing.add(publish_key)
+    task = asyncio.create_task(
+        _publish_task(
+            bot, quiz_id, chat_id, kind, title, started_by, notify_chat_id,
+            message_thread_id=message_thread_id,
+        )
+    )
     _tasks.add(task)
     task.add_done_callback(_tasks.discard)
     return None
 
 
-async def _publish_task(bot, quiz_id, chat_id, kind, title, started_by, notify_chat_id) -> None:
+async def _publish_task(
+    bot, quiz_id, chat_id, kind, title, started_by, notify_chat_id,
+    *, message_thread_id: int | None = None,
+) -> None:
     try:
-        await _publish_to_chat(bot, quiz_id, chat_id, kind, title, started_by, notify_chat_id)
+        await _publish_to_chat(
+            bot, quiz_id, chat_id, kind, title, started_by, notify_chat_id,
+            message_thread_id=message_thread_id,
+        )
     except Exception:
-        log.exception("quiz publish crashed (chat=%s)", chat_id)
+        log.exception(
+            "quiz publish crashed (chat=%s, topic=%s)", chat_id, message_thread_id
+        )
         try:
-            await bot.send_message(notify_chat_id, "❌ حدث خطأ غير متوقع أثناء نشر الاختبار. راجع سجلات الخادم.")
+            await bot.send_message(
+                notify_chat_id,
+                "❌ حدث خطأ غير متوقع أثناء نشر الاختبار. راجع سجلات الخادم.",
+                message_thread_id=message_thread_id if notify_chat_id == chat_id else None,
+            )
         except Exception:
-            pass
+            log.exception("Could not notify about failed quiz publication")
     finally:
-        _publishing.discard(chat_id)
+        _publishing.discard((chat_id, message_thread_id))
 
 
-async def _publish_to_chat(bot: Bot, quiz_id: int, chat_id: int, kind: str, title: str,
-                           started_by: int, notify_chat_id: int) -> None:
+async def _publish_to_chat(
+    bot: Bot, quiz_id: int, chat_id: int, kind: str, title: str,
+    started_by: int, notify_chat_id: int, *,
+    message_thread_id: int | None = None,
+) -> None:
     is_channel = kind == "channel"
     async with Session() as session:
         quiz = await session.get(Quiz, quiz_id)
-        if quiz is None or not quiz.questions:
-            await bot.send_message(notify_chat_id, "❌ الاختبار غير موجود أو بلا أسئلة.")
+        if quiz is None or not quiz.questions or quiz.is_draft:
+            await bot.send_message(notify_chat_id, "❌ الاختبار غير موجود أو ما زال مسودة.")
             return
         questions = list(quiz.questions)
         if quiz.randomize_questions:
@@ -573,6 +611,7 @@ async def _publish_to_chat(bot: Bot, quiz_id: int, chat_id: int, kind: str, titl
                 started_by=started_by,
                 total_questions=len(questions),
                 status="publishing",
+                message_thread_id=message_thread_id,
                 deadline_at=(
                     utcnow() + timedelta(seconds=quiz.time_limit_seconds)
                     if quiz.time_limit_seconds else None
@@ -594,6 +633,7 @@ async def _publish_to_chat(bot: Bot, quiz_id: int, chat_id: int, kind: str, titl
                         f"✍️ <b>السؤال {question.number}/{len(questions)}</b>\n\n"
                         f"{esc(question.question)}\n\n"
                         "<i>أرسل إجابتك بالرد مباشرة على رسالة السؤال.</i>",
+                        message_thread_id=message_thread_id,
                     )
                     session.add(
                         QuizSessionPrompt(
@@ -608,6 +648,7 @@ async def _publish_to_chat(bot: Bot, quiz_id: int, chat_id: int, kind: str, titl
                             chat_id,
                             question.image_file_id,
                             caption=f"🖼 <b>صورة السؤال {question.number}</b>",
+                            message_thread_id=message_thread_id,
                         )
                     payload = _poll_payload(
                         question,
@@ -615,6 +656,7 @@ async def _publish_to_chat(bot: Bot, quiz_id: int, chat_id: int, kind: str, titl
                         anonymous=is_channel,
                         randomize_options=quiz.randomize_options,
                     )
+                    payload["message_thread_id"] = message_thread_id
                     poll_message = await _send_poll(bot, chat_id, payload)
                     group_poll_message_id = poll_message.message_id
                     if qs is not None:
@@ -663,6 +705,7 @@ async def _publish_to_chat(bot: Bot, quiz_id: int, chat_id: int, kind: str, titl
                     f"🏁 <b>اختبار #{quiz.id}</b> — {sent} سؤال\n"
                     "أجيبوا عن الاستطلاعات والأسئلة النصية بالرد على رسائلها. "
                     "المشرف يضغط «إنهاء» لإعلان الترتيب.",
+                    message_thread_id=message_thread_id,
                     reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
                         InlineKeyboardButton(text="📊 الترتيب الحالي", callback_data=f"quizs:board:{qs.id}"),
                         InlineKeyboardButton(text="🏁 إنهاء الاختبار", callback_data=f"quizs:stop:{qs.id}"),
@@ -695,7 +738,11 @@ async def _publish_to_chat(bot: Bot, quiz_id: int, chat_id: int, kind: str, titl
     else:
         text = f"❌ لم يُنشر الاختبار في «{esc(title)}»: {esc(failure)}"
     try:
-        await bot.send_message(notify_chat_id, text)
+        await bot.send_message(
+            notify_chat_id,
+            text,
+            message_thread_id=message_thread_id if notify_chat_id == chat_id else None,
+        )
     except Exception:
         log.exception("Could not notify chat=%s about quiz publication result", notify_chat_id)
 
