@@ -34,7 +34,7 @@ async def _answer_callback(callback: Any, text: str) -> None:
         log.debug("Callback may already be expired", exc_info=True)
 
 
-async def handle_update_error(event: Any) -> bool:
+async def handle_update_error(event: Any) -> None:
     update = getattr(event, "update", None)
     exc = getattr(event, "exception", None)
     callback = getattr(update, "callback_query", None)
@@ -58,7 +58,7 @@ async def handle_update_error(event: Any) -> bool:
             chat_id,
             exc.retry_after,
         )
-        return True
+        return
 
     if isinstance(exc, TelegramForbiddenError):
         log.info(
@@ -83,7 +83,7 @@ async def handle_update_error(event: Any) -> bool:
                     callback,
                     "انتهت صلاحية هذا الزر أو لم تعد الرسالة موجودة. افتح القائمة من جديد.",
                 )
-            return True
+            return
         log.warning(
             "Telegram rejected update (user=%s, chat=%s): %s",
             user_id,

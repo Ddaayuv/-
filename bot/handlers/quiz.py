@@ -145,15 +145,17 @@ def _poll_payload(question: QuizQuestion, total: int, anonymous: bool) -> dict:
 
 async def _send_poll(bot: Bot, chat_id: int, payload: dict) -> Message:
     """send_poll that waits out Telegram flood limits instead of failing the whole quiz."""
-    for _ in range(5):
+    for attempt in range(5):
         try:
             return await bot.send_poll(chat_id=chat_id, **payload)
         except TelegramRetryAfter as exc:
-            delay=float(exc.retry_after)+1.0
+            delay = float(exc.retry_after) + 1.0
             log.warning(
                 "Telegram FloodWait while sending poll to chat=%s; retry=%s/5 delay=%.1fs",
-                chat_id, _+1, delay,
+                chat_id, attempt + 1, delay,
             )
+            if attempt == 4:
+                raise RuntimeError("Telegram kept asking to slow down") from exc
             await asyncio.sleep(delay)
     raise RuntimeError("Telegram kept asking to slow down")
 
