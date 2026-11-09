@@ -583,6 +583,7 @@ async def _publish_to_chat(bot: Bot, quiz_id: int, chat_id: int, kind: str, titl
         sent, failure = 0, ""
         for question in questions:
             try:
+                group_poll_message_id = None
                 if question.question_type == "text":
                     if is_channel:
                         failure = "الأسئلة النصية لا تدعم التصحيح الفردي في القنوات؛ انشر هذا الاختبار في مجموعة."
@@ -614,6 +615,7 @@ async def _publish_to_chat(bot: Bot, quiz_id: int, chat_id: int, kind: str, titl
                         randomize_options=quiz.randomize_options,
                     )
                     poll_message = await _send_poll(bot, chat_id, payload)
+                    group_poll_message_id = poll_message.message_id
                     if qs is not None:
                         session.add(
                             QuizSessionPoll(
@@ -626,6 +628,18 @@ async def _publish_to_chat(bot: Bot, quiz_id: int, chat_id: int, kind: str, titl
                         )
                 await session.commit()
                 sent += 1
+                if question.time_limit_seconds and group_poll_message_id is not None:
+                    question_timer = asyncio.create_task(
+                        _close_group_poll_after(
+                            bot,
+                            chat_id,
+                            group_poll_message_id,
+                            question.time_limit_seconds,
+                        ),
+                        name=f"quiz-group-question-timeout-{quiz_id}-{question.number}",
+                    )
+                    _tasks.add(question_timer)
+                    question_timer.add_done_callback(_tasks.discard)
             except Exception as exc:
                 await session.rollback()
                 failure = _publish_error(exc)
