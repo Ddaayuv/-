@@ -75,7 +75,12 @@ def _normalise_question(raw: dict[str, Any], number: int) -> dict[str, Any]:
     options = raw.get("options", [])
     if isinstance(options, str):
         options = [part.strip() for part in options.replace(";", "|").split("|") if part.strip()]
-    if not isinstance(options, list):
+    if isinstance(options, list):
+        options = [
+            str(value.get("text", "")).strip() if isinstance(value, dict) else str(value).strip()
+            for value in options
+        ]
+    else:
         raise ValueError(f"السؤال {number}: الخيارات يجب أن تكون قائمة أو نصاً مفصولاً بعلامة |.")
 
     correct_raw = raw.get("correct_option_index", raw.get("correct_index"))
