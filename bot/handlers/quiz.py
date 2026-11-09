@@ -13,10 +13,11 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import random
 from datetime import timedelta
 
 from aiogram import Bot, F, Router
-from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter
+from aiogram.exceptions import SkipHandler, TelegramAPIError, TelegramRetryAfter
 from aiogram.filters import Command, CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -26,10 +27,10 @@ from sqlalchemy.exc import IntegrityError
 
 from ..config import settings
 from ..db import (Quiz, QuizAttempt, QuizPoll, QuizQuestion, QuizResponse, QuizSession, QuizSessionAnswer,
-                  QuizSessionPoll, QuizTarget, Session, audit, utcnow)
+                  QuizSessionPoll, QuizSessionPrompt, QuizPrompt, QuizTarget, Session, audit, utcnow)
 from ..membership import inspect_channel, status_of
 from ..quiz_parser import MAX_EXPLANATION, parse_quiz_text
-from ..utils import esc, parse_chat_ref
+from ..utils import esc, normalize, parse_chat_ref
 
 router = Router()
 log = logging.getLogger(__name__)
@@ -41,6 +42,7 @@ MEDALS = ["🥇", "🥈", "🥉"]
 
 _publishing: set[int] = set()          # chat ids with a publish in progress
 _tasks: set[asyncio.Task] = set()      # keep references so tasks are not garbage collected
+_attempt_tasks: set[asyncio.Task] = set()
 
 
 class QuizInput(StatesGroup):
@@ -124,18 +126,31 @@ async def _save_quiz(session, user_id: int, raw: str, parsed: dict) -> Quiz:
     return quiz
 
 
-def _poll_payload(question: QuizQuestion, total: int, anonymous: bool) -> dict:
-    """Arguments for send_poll. Text is HTML-escaped and sent with parse_mode=HTML explicitly:
-    the bot's default parse mode is HTML, so a question like "ما ناتج <script>" would otherwise
-    be mangled or rejected by Telegram."""
-    options = json.loads(question.options_json)
+def _poll_payload(
+    question: QuizQuestion,
+    total: int,
+    anonymous: bool,
+    *,
+    randomize_options: bool = False,
+) -> dict:
+    """Build a native Telegram Quiz Poll and keep the correct index aligned."""
+    options = json.loads(question.options_json or "[]")
+    if not 2 <= len(options) <= 6:
+        raise ValueError(
+            f"السؤال {question.number} لا يحتوي خيارات صالحة لاستطلاع Telegram."
+        )
+    order = list(range(len(options)))
+    if randomize_options:
+        random.shuffle(order)
+    ordered_options = [options[index] for index in order]
+    correct_index = order.index(question.correct_option_index)
     payload = {
         "question": esc(f"{question.number}/{total} {question.question}"[:300]),
         "question_parse_mode": "HTML",
-        "options": [str(opt["text"])[:100] for opt in options],
+        "options": [str(opt["text"])[:100] for opt in ordered_options],
         "type": "quiz",
         "is_anonymous": anonymous,
-        "correct_option_id": question.correct_option_index,
+        "correct_option_id": correct_index,
     }
     if question.explanation:
         payload["explanation"] = esc(question.explanation[:MAX_EXPLANATION])
@@ -504,6 +519,20 @@ async def bot_membership_changed(event: ChatMemberUpdated):
 
 @router.callback_query(F.data == "quiz:start")
 async def quiz_start(cb: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await cb.message.answer(
+        "🤖 <b>إنشاء اختبار</b>\\n\\nاختر طريقة الإنشاء:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🧩 إنشاء خطوة بخطوة", callback_data="quiz:wizard")],
+            [InlineKeyboardButton(text="📝 إنشاء من نص منسّق (الطريقة القديمة)", callback_data="quiz:legacy")],
+            [InlineKeyboardButton(text="📁 استيراد ملف", callback_data="quiz:import")],
+        ]),
+    )
+    await cb.answer()
+
+
+@router.callback_query(F.data == "quiz:legacy")
+async def quiz_legacy_start(cb: CallbackQuery, state: FSMContext):
     await state.clear()
     await state.set_state(QuizInput.text)
     await cb.message.answer(quiz_prompt(), reply_markup=_kb())
