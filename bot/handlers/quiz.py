@@ -239,6 +239,114 @@ async def _expire_attempt_after(bot: Bot, attempt_id: int, delay: int) -> None:
         log.exception("Quiz attempt timeout task failed for attempt=%s", attempt_id)
 
 
+async def _expire_private_question(
+    bot: Bot,
+    attempt_id: int,
+    question_number: int,
+    delay: int,
+    *,
+    message_id: int | None = None,
+) -> None:
+    """Auto-record a missed timed question and close its poll where applicable."""
+    try:
+        await asyncio.sleep(max(0, delay))
+        completed = False
+        user_id = None
+        async with Session() as session:
+            attempt = await session.get(QuizAttempt, attempt_id)
+            if attempt is None or attempt.status not in {"active", "partial"}:
+                return
+            existing = await session.scalar(
+                select(QuizResponse.id).where(
+                    QuizResponse.attempt_id == attempt.id,
+                    QuizResponse.question_number == question_number,
+                )
+            )
+            if existing:
+                return
+            user_id = attempt.user_telegram_id
+            session.add(
+                QuizResponse(
+                    attempt_id=attempt.id,
+                    question_number=question_number,
+                    selected_option_index=-1,
+                    is_correct=False,
+                    points_awarded=0.0,
+                )
+            )
+            try:
+                await session.flush()
+            except IntegrityError:
+                await session.rollback()
+                return
+            attempt.answered_count += 1
+            completed = (
+                attempt.total_questions > 0
+                and attempt.answered_count >= attempt.total_questions
+            )
+            if completed:
+                attempt.status = "completed"
+                attempt.finished_at = utcnow()
+            await session.commit()
+
+        if message_id is not None and user_id is not None:
+            try:
+                await bot.stop_poll(user_id, message_id)
+            except TelegramAPIError:
+                log.info(
+                    "Timed poll already closed or unavailable (user=%s, message=%s)",
+                    user_id,
+                    message_id,
+                )
+        if completed:
+            await _send_private_result(bot, attempt_id)
+        elif user_id is not None:
+            try:
+                await bot.send_message(
+                    user_id,
+                    f"⏱ انتهى وقت السؤال {question_number} وتم احتسابه دون درجة.",
+                )
+            except Exception:
+                log.exception(
+                    "Could not notify user=%s that question=%s expired",
+                    user_id,
+                    question_number,
+                )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        log.exception(
+            "Per-question timer failed for attempt=%s question=%s",
+            attempt_id,
+            question_number,
+        )
+
+
+async def _close_group_poll_after(
+    bot: Bot,
+    chat_id: int,
+    message_id: int,
+    delay: int,
+) -> None:
+    try:
+        await asyncio.sleep(max(0, delay))
+        await bot.stop_poll(chat_id, message_id)
+    except asyncio.CancelledError:
+        raise
+    except TelegramAPIError:
+        log.info(
+            "Timed group poll already closed or unavailable (chat=%s, message=%s)",
+            chat_id,
+            message_id,
+        )
+    except Exception:
+        log.exception(
+            "Could not close timed group poll chat=%s message=%s",
+            chat_id,
+            message_id,
+        )
+
+
 async def _publish_attempt(bot: Bot, session, quiz: Quiz, user_id: int) -> None:
     """Start a private attempt with native polls and reply-based text questions."""
     if not quiz.questions:
@@ -302,6 +410,7 @@ async def _publish_attempt(bot: Bot, session, quiz: Quiz, user_id: int) -> None:
                     question.image_file_id,
                     caption=f"🖼 <b>صورة السؤال {question.number}</b>",
                 )
+            timed_message_id = None
             if question.question_type == "text":
                 prompt = await bot.send_message(
                     user_id,
@@ -309,6 +418,7 @@ async def _publish_attempt(bot: Bot, session, quiz: Quiz, user_id: int) -> None:
                     f"{esc(question.question)}\n\n"
                     "<i>أجب بالرد مباشرة على هذه الرسالة.</i>",
                 )
+                timed_message_id = prompt.message_id
                 session.add(
                     QuizPrompt(
                         attempt_id=attempt.id,
@@ -324,16 +434,34 @@ async def _publish_attempt(bot: Bot, session, quiz: Quiz, user_id: int) -> None:
                     randomize_options=quiz.randomize_options,
                 )
                 poll_message = await _send_poll(bot, user_id, payload)
+                timed_message_id = poll_message.message_id
                 session.add(
                     QuizPoll(
                         poll_id=poll_message.poll.id,
                         attempt_id=attempt.id,
                         question_number=question.number,
                         correct_option_index=payload["correct_option_id"],
+                        message_id=poll_message.message_id,
                     )
                 )
             await session.commit()
             sent += 1
+            if question.time_limit_seconds:
+                question_task = asyncio.create_task(
+                    _expire_private_question(
+                        bot,
+                        attempt.id,
+                        question.number,
+                        question.time_limit_seconds,
+                        message_id=(
+                            timed_message_id
+                            if question.question_type != "text" else None
+                        ),
+                    ),
+                    name=f"quiz-question-timeout-{attempt.id}-{question.number}",
+                )
+                _attempt_tasks.add(question_task)
+                question_task.add_done_callback(_attempt_tasks.discard)
         except Exception as exc:
             await session.rollback()
             failure = _publish_error(exc)
