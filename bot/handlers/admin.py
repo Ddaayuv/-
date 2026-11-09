@@ -8,10 +8,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ..config import settings
 from ..db import User, Subject, Section, Item, BotSetting, audit, set_setting, setting_enabled, create_item, slugify, build_search_text
 from ..utils import esc, is_url
+from ..telegram_utils import safe_copy_message
 import asyncio
+import logging
 from .menu_manager import router as menu_manager_router
 from datetime import datetime, timedelta
 router=Router()
+log=logging.getLogger(__name__)
 router.include_router(menu_manager_router)
 def owner(uid): return uid in settings.owner_ids
 def grid(buttons,w=2): return [buttons[i:i+w] for i in range(0,len(buttons),w)]
@@ -206,6 +209,7 @@ async def finish_add(m,state,session):
     try:
         item=await create_item(session,{"subject_id":d["subject_id"],"section_id":d["section_id"],"title":d["title"],"desc":d.get("description",""),"study_mode":d.get("study_mode","general"),"attachments":att},m.from_user.id); await audit(session,m.from_user.id,"add_item",f"#{item.id} {item.title}"); await session.commit(); await state.clear(); await m.answer(f"✅ <b>تم الحفظ والنشر</b>\n🆔 #{item.id}\n📘 {esc(item.title)}\n📎 {len(att)} مرفق",reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="➕ إضافة آخر",callback_data="adm:add")],[InlineKeyboardButton(text="🛠 اللوحة",callback_data="adm:panel")]]))
     except Exception:
+        log.exception("Failed saving content for user=%s", m.from_user.id)
         await session.rollback(); await m.answer("❌ تعذر الحفظ. اكتب /done للمحاولة مرة أخرى أو /cancel للإلغاء.")
 @router.message(AddContent.attachments)
 async def collect(m,state):
@@ -282,13 +286,36 @@ async def broadcast_preview(m,state,session):
 async def broadcast_cancel(cb,state): await state.clear(); await cb.message.edit_text("❌ تم إلغاء الإذاعة.",reply_markup=panel_kb()); await cb.answer()
 @router.callback_query(F.data=="adm:broadcast:confirm")
 async def broadcast_confirm(cb,state,session):
-    if not owner(cb.from_user.id):return await cb.answer("ممنوع",show_alert=True)
-    d=await state.get_data(); users=(await session.scalars(select(User.telegram_id))).all(); ok=bad=0; await cb.message.edit_text(f"📢 جارٍ الإرسال إلى {len(users)} مستخدم...")
+    if not owner(cb.from_user.id):
+        return await cb.answer("ممنوع",show_alert=True)
+    data=await state.get_data()
+    if not data.get("chat_id") or not data.get("message_id"):
+        await state.clear()
+        return await cb.answer("انتهت جلسة الإذاعة؛ أعد المحاولة.",show_alert=True)
+    users=(await session.scalars(select(User.telegram_id))).all()
+    ok=bad=0
+    await cb.message.edit_text(f"📢 جارٍ الإرسال إلى {len(users)} مستخدم...")
     for uid in users:
-        try:await cb.bot.copy_message(uid,d["chat_id"],d["message_id"]); ok+=1
-        except:bad+=1
-        await asyncio.sleep(.04)
-    await state.clear(); await cb.message.edit_text(f"✅ انتهت الإذاعة\nنجحت: {ok}\nفشلت: {bad}",reply_markup=back_panel()); await cb.answer()
+        try:
+            delivered=await safe_copy_message(
+                cb.bot, chat_id=uid, from_chat_id=data["chat_id"],
+                message_id=data["message_id"],
+            )
+            if delivered:
+                ok+=1
+            else:
+                bad+=1
+        except Exception:
+            log.exception("Broadcast failed unexpectedly for user=%s",uid)
+            bad+=1
+        await asyncio.sleep(0.05)
+    await state.clear()
+    await cb.message.edit_text(
+        f"✅ انتهت الإذاعة\nنجحت: {ok}\nفشلت: {bad}",
+        reply_markup=back_panel(),
+    )
+    await cb.answer()
+
 @router.callback_query(F.data=="adm:home")
 async def admin_home(cb,session):
     if owner(cb.from_user.id):
@@ -315,7 +342,12 @@ async def backup_now(m):
     import os
     from aiogram.types import FSInputFile
     from ..backup import make_backup
-    path=await make_backup(); await m.answer_document(FSInputFile(path),caption="💾 نسخة كاملة (تشمل المرفقات). احتفظ بها. للاسترجاع أرسل الملف مع الأمر /restore كتعليق."); os.remove(path)
+    path=await make_backup()
+    try:
+        await m.answer_document(FSInputFile(path),caption="💾 نسخة كاملة (تشمل المرفقات). احتفظ بها. للاسترجاع أرسل الملف مع الأمر /restore كتعليق.")
+    finally:
+        if os.path.exists(path):
+            os.remove(path)
 @router.message(Command("restore"))
 async def restore_cmd(m):
     if not owner(m.from_user.id):return
@@ -330,5 +362,6 @@ async def restore_file(m):
     try:
         buf=io.BytesIO(); await m.bot.download(doc,destination=buf); added=await restore_backup(json.loads(buf.getvalue().decode("utf-8")))
     except Exception as e:
+        log.exception("Backup restore failed for owner=%s", m.from_user.id)
         return await m.answer(f"❌ فشل الاسترجاع: {esc(str(e))[:300]}")
     await m.answer(f"✅ تم الاسترجاع\n📚 مواد: {added['subjects']}\n📦 محتوى: {added['items']}\n📎 مرفقات: {added['attachments']}\n👥 مستخدمون: {added['users']}")

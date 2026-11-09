@@ -9,6 +9,9 @@ from ..config import settings
 from ..db import Subject, Section, Item, get_setting
 from ..utils import esc, normalize
 from ..menu_buttons import build_menu_markup
+import logging
+
+log=logging.getLogger(__name__)
 
 router=Router()
 class SearchInput(StatesGroup): term=State()
@@ -45,7 +48,9 @@ async def check_sub(cb,session):
         if allowed:
             await cb.answer("تم التحقق ✅"); await show_home(cb.message,session,cb.from_user.id)
         else: await cb.answer("لم يتم العثور على اشتراكك بعد",show_alert=True)
-    except Exception: await cb.answer("تعذر التحقق. تأكد أن البوت مشرف بالقناة.",show_alert=True)
+    except Exception:
+        log.exception("Membership re-check failed for user=%s", cb.from_user.id)
+        await cb.answer("تعذر التحقق. تأكد أن البوت مشرف بالقناة.",show_alert=True)
 @router.callback_query(F.data=="search")
 async def search_button(cb,state):
     await state.set_state(SearchInput.term); await cb.message.answer("🔎 أرسل كلمة البحث الآن، أو اكتب /cancel للإلغاء."); await cb.answer()
@@ -105,7 +110,9 @@ async def section(cb,session):
 @router.callback_query(F.data.startswith("item:"))
 async def item(cb,session):
     try:x=await session.get(Item,int(cb.data.split(":",1)[1]))
-    except Exception:x=None
+    except Exception:
+        log.exception("Could not load item for callback=%s", cb.data)
+        x=None
     if not x or not x.is_published:return await cb.answer("المحتوى غير متاح",show_alert=True)
     body=f"📘 <b>{esc(x.title)}</b>"+(f"\n\n{esc(x.description)}" if x.description else "")
     await cb.message.answer(body)
@@ -118,7 +125,9 @@ async def item(cb,session):
             elif a.kind=="voice" and a.tg_file_id:await cb.message.answer_voice(a.tg_file_id,caption=cap)
             elif a.kind=="photo" and a.tg_file_id:await cb.message.answer_photo(a.tg_file_id,caption=cap)
             elif a.url:await cb.message.answer(a.url)
-        except Exception:await cb.message.answer(f"⚠️ تعذّر إرسال المرفق: {cap}")
+        except Exception:
+            log.exception("Could not send attachment=%s for item=%s", a.id, x.id)
+            await cb.message.answer(f"⚠️ تعذّر إرسال المرفق: {cap}")
     await cb.answer()
 @router.callback_query(F.data=="home")
 async def home(cb,session):

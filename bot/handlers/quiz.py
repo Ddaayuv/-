@@ -149,7 +149,12 @@ async def _send_poll(bot: Bot, chat_id: int, payload: dict) -> Message:
         try:
             return await bot.send_poll(chat_id=chat_id, **payload)
         except TelegramRetryAfter as exc:
-            await asyncio.sleep(exc.retry_after + 1)
+            delay=float(exc.retry_after)+1.0
+            log.warning(
+                "Telegram FloodWait while sending poll to chat=%s; retry=%s/5 delay=%.1fs",
+                chat_id, _+1, delay,
+            )
+            await asyncio.sleep(delay)
     raise RuntimeError("Telegram kept asking to slow down")
 
 
@@ -355,8 +360,13 @@ async def finish_session(bot: Bot, session_id: int) -> bool:
     for poll in polls:
         try:
             await bot.stop_poll(chat_id, poll.message_id)
+        except TelegramAPIError:
+            log.warning(
+                "Could not stop poll=%s in chat=%s; it may already be closed/deleted",
+                poll.poll_id, chat_id, exc_info=True,
+            )
         except Exception:
-            pass
+            log.exception("Unexpected error stopping poll=%s in chat=%s", poll.poll_id, chat_id)
         await asyncio.sleep(0.35)
     try:
         await bot.send_message(chat_id, _format_board(rows, quiz_id, total, final=True))
