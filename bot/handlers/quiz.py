@@ -17,7 +17,8 @@ import random
 from datetime import timedelta
 
 from aiogram import Bot, F, Router
-from aiogram.exceptions import SkipHandler, TelegramAPIError, TelegramRetryAfter
+from aiogram.dispatcher.event.bases import SkipHandler
+from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter
 from aiogram.filters import Command, CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
