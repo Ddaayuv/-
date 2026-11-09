@@ -39,6 +39,7 @@ class QuizBuild(StatesGroup):
     correct_text = State()
     explanation = State()
     points = State()
+    question_time = State()
     import_file = State()
 
 
@@ -544,6 +545,24 @@ async def receive_points(message: Message, state: FSMContext) -> None:
     question = dict(data.get("current_question") or {})
     question["points"] = points
     question["explanation"] = data.get("current_explanation")
+    await state.update_data(current_question=question)
+    await state.set_state(QuizBuild.question_time)
+    await message.answer(
+        "أرسل الوقت المسموح لهذا السؤال بالثواني. أرسل 0 بلا حد زمني."
+    )
+
+
+@router.message(QuizBuild.question_time)
+async def receive_question_time(message: Message, state: FSMContext) -> None:
+    try:
+        seconds = int((message.text or "").strip())
+        if not 0 <= seconds <= 7200:
+            raise ValueError
+    except ValueError:
+        return await message.answer("أرسل عدداً صحيحاً من 0 إلى 7200 ثانية.")
+    data = await state.get_data()
+    question = dict(data.get("current_question") or {})
+    question["time_limit_seconds"] = seconds or None
     questions = list(data.get("build_questions") or [])
     if len(questions) >= 100:
         await state.set_state(None)
