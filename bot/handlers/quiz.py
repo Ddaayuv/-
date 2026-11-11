@@ -909,22 +909,16 @@ async def quiz_maintenance_loop(bot: Bot):
                 due = (await s.scalars(select(GroupQuizSchedule).where(
                     GroupQuizSchedule.is_active.is_(True), GroupQuizSchedule.run_at <= now
                 ).order_by(GroupQuizSchedule.run_at).limit(20))).all()
-                due_data = [(x.id, x.chat_id, x.quiz_id, x.thread_id, x.requested_by, x.repeat_mode) for x in due]
+                due_data = [(x.id, x.chat_id, x.quiz_id, x.thread_id, x.requested_by, x.repeat_mode, x.run_at) for x in due]
                 expired = (await s.scalars(select(QuizSession).where(
                     QuizSession.status.in_(("active", "paused")), QuizSession.ends_at.is_not(None),
                     QuizSession.ends_at <= now
                 ))).all()
                 expired_ids = [x.id for x in expired]
-                for item in due:
-                    if item.repeat_mode == "none":
-                        item.is_active = False
-                    else:
-                        item.run_at = next_schedule_time(item.run_at, item.repeat_mode) or item.run_at
-                    item.last_run_at = now
                 await s.commit()
             for session_id in expired_ids:
                 await finish_session(bot, session_id)
-            for _sid, chat_id, quiz_id, thread_id, requester, _repeat in due_data:
+            for schedule_id, chat_id, quiz_id, thread_id, requester, repeat_mode, scheduled_at in due_data:
                 async with Session() as s:
                     target = await s.scalar(select(QuizTarget).where(QuizTarget.chat_id == chat_id))
                     quiz = await s.get(Quiz, quiz_id)
@@ -935,6 +929,15 @@ async def quiz_maintenance_loop(bot: Bot):
                                                   requester, chat_id, thread_id)
                     if error:
                         log.info("Scheduled quiz %s was not launched: %s", quiz_id, error)
+                        continue
+                    schedule = await s.get(GroupQuizSchedule, schedule_id)
+                    if schedule and schedule.is_active and schedule.run_at == scheduled_at:
+                        schedule.last_run_at = now
+                        if repeat_mode == "none":
+                            schedule.is_active = False
+                        else:
+                            schedule.run_at = next_schedule_time(schedule.run_at, repeat_mode) or schedule.run_at
+                        await s.commit()
             await asyncio.sleep(30)
         except asyncio.CancelledError:
             raise
