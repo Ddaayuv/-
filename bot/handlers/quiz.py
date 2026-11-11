@@ -794,6 +794,86 @@ async def group_quiz_schedule(message: Message, command: CommandObject, session)
     await message.reply(f"✅ تمت جدولة الاختبار #{quiz_id} بتاريخ {local:%Y-%m-%d %H:%M} ({cfg.timezone}).")
 
 
+
+@router.message(Command("quizrepost"), F.chat.type.in_(GROUP_TYPES))
+async def group_quiz_repost(message: Message, command: CommandObject, session):
+    uid = message.from_user.id if message.from_user else 0
+    if not (_anonymous_admin(message) or await is_chat_admin(message.bot, message.chat.id, uid)):
+        return await message.reply("⛔ إعادة النشر للمشرفين فقط.")
+    raw = (command.args or "").strip()
+    qs = await _latest_session(session, message.chat.id, thread_id=getattr(message, "message_thread_id", None))
+    try:
+        quiz_id = int(raw) if raw else (qs.quiz_id if qs else 0)
+    except ValueError:
+        return await message.reply("استخدم: /quizrepost [رقم_الاختبار]")
+    quiz = await session.get(Quiz, quiz_id)
+    if quiz is None:
+        return await message.reply("الاختبار غير موجود.")
+    cfg = await _group_settings(session, message.chat.id, message.chat.title or "")
+    if not await _can_start_in_group(message.bot, message.chat.id, uid, _anonymous_admin(message), cfg):
+        return await message.reply("⛔ لا تملك صلاحية إعادة النشر.")
+    error = await _launch_publish(message.bot, quiz.id, message.chat.id, "group",
+        message.chat.title or "", uid, message.chat.id, getattr(message, "message_thread_id", None))
+    if error:
+        return await message.reply(error)
+    await message.reply(f"🔁 بدأت إعادة نشر الاختبار #{quiz.id}.")
+
+
+@router.message(Command("quizstats"), F.chat.type.in_(GROUP_TYPES))
+async def group_quiz_stats(message: Message, session):
+    uid = message.from_user.id if message.from_user else 0
+    if not (_anonymous_admin(message) or await is_chat_admin(message.bot, message.chat.id, uid)):
+        return await message.reply("⛔ الإحصائيات للمشرفين فقط.")
+    qs = await _latest_session(session, message.chat.id, thread_id=getattr(message, "message_thread_id", None))
+    if qs is None:
+        return await message.reply("لا توجد اختبارات مسجلة.")
+    participant_count = await session.scalar(select(func.count(func.distinct(QuizSessionAnswer.user_telegram_id))).where(QuizSessionAnswer.session_id == qs.id)) or 0
+    answer_count = await session.scalar(select(func.count(QuizSessionAnswer.id)).where(QuizSessionAnswer.session_id == qs.id)) or 0
+    correct_count = await session.scalar(select(func.count(QuizSessionAnswer.id)).where(QuizSessionAnswer.session_id == qs.id, QuizSessionAnswer.is_correct.is_(True))) or 0
+    await message.reply(f"📊 <b>إحصائيات الاختبار #{qs.quiz_id}</b>\nالمشاركون: {participant_count}\nالإجابات: {answer_count}\nالإجابات الصحيحة: {correct_count}\nالحالة: {qs.status}")
+
+
+@router.message(Command("quizgroups"), F.chat.type == "private")
+async def developer_quiz_groups(message: Message, session):
+    if message.from_user.id not in settings.owner_ids:
+        return await message.answer("⛔ هذا الأمر للمطوّر فقط.")
+    targets = (await session.scalars(select(QuizTarget).where(QuizTarget.kind.in_(("group", "supergroup")))
+        .order_by(QuizTarget.created_at.desc()).limit(50))).all()
+    if not targets:
+        return await message.answer("لا توجد مجموعات مرتبطة بعد.")
+    rows = []
+    for target in targets:
+        count = await session.scalar(select(func.count(QuizSession.id)).where(QuizSession.chat_id == target.chat_id)) or 0
+        active = await session.scalar(select(QuizSession.id).where(QuizSession.chat_id == target.chat_id,
+            QuizSession.status.in_(("publishing", "active", "paused"))).order_by(QuizSession.id.desc()).limit(1))
+        cfg = await session.get(GroupSettings, target.chat_id)
+        state = "مفعّلة" if cfg is None or cfg.enabled else "معطّلة"
+        rows.append([InlineKeyboardButton(text=f"{target.title[:22]} • {count} اختبار • {state}", callback_data=f"quizdev:disable:{target.chat_id}")])
+        if active:
+            rows.append([InlineKeyboardButton(text=f"إنهاء جلسة #{active}", callback_data=f"quizdev:finish:{active}")])
+    await message.answer("🛠 <b>مجموعات الاختبارات</b>\nاضغط على المجموعة لتعطيل/تفعيل الاختبارات فيها، أو أنهِ جلسة عالقة:", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+@router.callback_query(F.data.startswith("quizdev:"))
+async def developer_quiz_group_action(cb: CallbackQuery, session):
+    if cb.from_user.id not in settings.owner_ids:
+        return await cb.answer("⛔ للمطوّر فقط.", show_alert=True)
+    try:
+        _, action, raw_id = cb.data.split(":")
+        value = int(raw_id)
+    except (ValueError, TypeError):
+        return await cb.answer("طلب غير صالح.", show_alert=True)
+    if action == "finish":
+        ok = await finish_session(cb.bot, value)
+        return await cb.answer("تم إنهاء الجلسة." if ok else "الجلسة منتهية أو غير موجودة.", show_alert=True)
+    if action == "disable":
+        cfg = await _group_settings(session, value)
+        cfg.enabled = not cfg.enabled
+        await session.commit()
+        return await cb.answer("تم تفعيل الاختبارات." if cfg.enabled else "تم تعطيل الاختبارات.", show_alert=True)
+    await cb.answer("إجراء غير معروف.", show_alert=True)
+
+
 @router.message(Command("quizexport"), F.chat.type.in_(GROUP_TYPES))
 async def group_quiz_export(message: Message, session, command: CommandObject):
     uid = message.from_user.id if message.from_user else 0
