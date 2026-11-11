@@ -32,6 +32,7 @@ from ..db import (Quiz, QuizAttempt, QuizPoll, QuizQuestion, QuizResponse, QuizS
 from ..membership import inspect_channel, status_of
 from ..quiz_parser import MAX_EXPLANATION, parse_quiz_text
 from ..utils import esc, parse_chat_ref
+from ..group_quiz_logic import can_start_quiz, rank_leaderboard, local_schedule_to_utc, next_schedule_time
 
 router = Router()
 log = logging.getLogger(__name__)
@@ -345,7 +346,7 @@ async def _leaderboard(session, session_id: int) -> list[tuple[int, str, int, in
         .group_by(QuizSessionAnswer.user_telegram_id)
         .order_by(correct.desc(), answered.desc(), func.max(QuizSessionAnswer.answered_at).asc())
     )).all()
-    return [(uid, name or "مجهول", int(c or 0), int(n or 0)) for uid, name, c, n in rows]
+    return rank_leaderboard([(uid, name or "مجهول", int(c or 0), int(n or 0)) for uid, name, c, n in rows])
 
 
 def _format_board(rows, quiz_id: int, total: int, limit: int = 10, *, final: bool = False, anonymous: bool = False) -> str:
@@ -473,30 +474,21 @@ async def _group_settings(session, chat_id: int, title: str = "") -> GroupSettin
 
 
 async def _can_start_in_group(bot: Bot, chat_id: int, user_id: int, anonymous: bool, cfg: GroupSettings) -> bool:
-    if not cfg.enabled:
-        return False
-    if anonymous:
-        # Telegram hides the real administrator identity. Accept anonymous
-        # admin commands only under the all-admins policy.
-        return cfg.start_policy == "all_admins"
     if user_id in settings.owner_ids:
-        return True
+        return bool(cfg.enabled)
     try:
-        member = await bot.get_chat_member(chat_id, user_id)
+        member = await bot.get_chat_member(chat_id, user_id) if not anonymous else None
+        status = status_of(member) if member is not None else "unknown"
     except TelegramAPIError:
-        return False
-    status = status_of(member)
-    if cfg.start_policy == "owner_only":
-        return status == "creator"
-    if status not in {"creator", "administrator"}:
-        return False
-    if cfg.start_policy == "selected":
-        try:
-            allowed = {int(x) for x in json.loads(cfg.allowed_admin_ids_json or "[]")}
-        except (ValueError, TypeError):
-            allowed = set()
-        return user_id in allowed or status == "creator"
-    return True
+        status = "unknown"
+    try:
+        allowed = {int(x) for x in json.loads(cfg.allowed_admin_ids_json or "[]")}
+    except (ValueError, TypeError):
+        allowed = set()
+    return can_start_quiz(cfg.start_policy, status, enabled=cfg.enabled,
+                           is_owner_id=user_id in settings.owner_ids,
+                           allowed_admin_ids=allowed, user_id=user_id,
+                           anonymous_admin=anonymous)
 
 
 @router.message(Command("quizsettings"), F.chat.type.in_(GROUP_TYPES))
@@ -574,6 +566,12 @@ async def group_quiz_allow_admin(message: Message, session, command: CommandObje
     uid = message.from_user.id if message.from_user else 0
     if not await is_chat_admin(message.bot, message.chat.id, uid):
         return await message.reply("⛔ مالك المجموعة أو مشرف مخوّل فقط.")
+    try:
+        actor = await message.bot.get_chat_member(message.chat.id, uid)
+        if status_of(actor) != "creator" and uid not in settings.owner_ids:
+            return await message.reply("⛔ إدارة قائمة البدء المسموح بها لمالك المجموعة فقط.")
+    except TelegramAPIError:
+        return await message.reply("تعذّر التحقق من مالك المجموعة.")
     try:
         target_id = int((command.args or "").strip())
     except ValueError:
@@ -714,6 +712,47 @@ async def group_quiz_delete(message: Message, session, command: CommandObject):
     await message.reply("🗑️ حُذف الاختبار وسجلات رسائله المعروفة.")
 
 
+
+@router.message(Command("quiztimezone"), F.chat.type.in_(GROUP_TYPES))
+async def group_quiz_timezone(message: Message, command: CommandObject, session):
+    uid = message.from_user.id if message.from_user else 0
+    if not await is_chat_admin(message.bot, message.chat.id, uid):
+        return await message.reply("⛔ ضبط المنطقة الزمنية للمشرفين فقط.")
+    name = (command.args or "").strip()
+    if not name:
+        cfg = await _group_settings(session, message.chat.id)
+        return await message.reply(f"المنطقة الزمنية الحالية: {cfg.timezone}\nاستخدم /quiztimezone Asia/Baghdad")
+    try:
+        ZoneInfo(name)
+    except Exception:
+        return await message.reply("اسم المنطقة الزمنية غير صالح. مثال: Asia/Baghdad")
+    cfg = await _group_settings(session, message.chat.id, message.chat.title or "")
+    cfg.timezone = name
+    await session.commit()
+    await message.reply(f"✅ تم ضبط توقيت الجدولة إلى {name}.")
+
+
+@router.message(Command("quizdeny"), F.chat.type.in_(GROUP_TYPES))
+async def group_quiz_deny_admin(message: Message, command: CommandObject, session):
+    uid = message.from_user.id if message.from_user else 0
+    try:
+        actor = await message.bot.get_chat_member(message.chat.id, uid)
+        if status_of(actor) != "creator" and uid not in settings.owner_ids:
+            return await message.reply("⛔ هذا الأمر لمالك المجموعة فقط.")
+        target_id = int((command.args or "").strip())
+    except (ValueError, TelegramAPIError):
+        return await message.reply("استخدم: /quizdeny رقم_المستخدم")
+    cfg = await _group_settings(session, message.chat.id, message.chat.title or "")
+    try:
+        ids = {int(x) for x in json.loads(cfg.allowed_admin_ids_json or "[]")}
+    except (ValueError, TypeError):
+        ids = set()
+    ids.discard(target_id)
+    cfg.allowed_admin_ids_json = json.dumps(sorted(ids))
+    await session.commit()
+    await message.reply(f"✅ أُزيل المستخدم {target_id} من القائمة المسموح لها.")
+
+
 @router.message(Command("quizschedule"), F.chat.type.in_(GROUP_TYPES))
 async def group_quiz_schedule(message: Message, command: CommandObject, session):
     uid = message.from_user.id if message.from_user else 0
@@ -734,8 +773,10 @@ async def group_quiz_schedule(message: Message, command: CommandObject, session)
     if quiz is None or (quiz.owner_telegram_id != uid and uid not in settings.owner_ids):
         return await message.reply("الاختبار غير موجود أو ليس ملكك.")
     cfg = await _group_settings(session, message.chat.id, message.chat.title or "")
-    local = local.replace(tzinfo=ZoneInfo(cfg.timezone))
-    utc = local.astimezone(timezone.utc).replace(tzinfo=None)
+    try:
+        utc = local_schedule_to_utc(local, cfg.timezone)
+    except Exception:
+        return await message.reply("المنطقة الزمنية المخزنة غير صالحة. صححها عبر /quiztimezone.")
     if utc <= utcnow():
         return await message.reply("موعد الجدولة يجب أن يكون في المستقبل.")
     session.add(GroupQuizSchedule(chat_id=message.chat.id, quiz_id=quiz_id,
@@ -790,7 +831,7 @@ async def quiz_maintenance_loop(bot: Bot):
                     if item.repeat_mode == "none":
                         item.is_active = False
                     else:
-                        item.run_at = item.run_at + timedelta(days=1 if item.repeat_mode == "daily" else 7)
+                        item.run_at = next_schedule_time(item.run_at, item.repeat_mode) or item.run_at
                     item.last_run_at = now
                 await s.commit()
             for session_id in expired_ids:
