@@ -369,10 +369,9 @@ def _format_board(rows, quiz_id: int, total: int, limit: int = 10, *, final: boo
 
 async def _latest_session(session, chat_id: int, only_active: bool = False, thread_id: int | None = None):
     q = select(QuizSession).where(QuizSession.chat_id == chat_id)
-    if thread_id is not None:
-        q = q.where(QuizSession.thread_id == thread_id)
+    q = q.where(QuizSession.thread_id == thread_id) if thread_id is not None else q.where(QuizSession.thread_id.is_(None))
     if only_active:
-        q = q.where(QuizSession.status.in_(("publishing", "active")))
+        q = q.where(QuizSession.status.in_(("publishing", "active", "paused")))
     return await session.scalar(q.order_by(QuizSession.id.desc()))
 
 
@@ -427,8 +426,11 @@ async def session_buttons(cb: CallbackQuery, session):
         return await cb.answer("هذا الاختبار لم يعد موجوداً.", show_alert=True)
     if action == "board":
         rows = await _leaderboard(session, qs.id)
+        cfg = json.loads(qs.settings_json or "{}")
         short = ["📊 الترتيب الحالي"]
         for i, (_u, name, correct, _n) in enumerate(rows[:5]):
+            if cfg.get("anonymous_mode"):
+                name = f"مشارك {i + 1}"
             short.append(f"{MEDALS[i] if i < 3 else str(i + 1) + '.'} {name[:18]} {correct}/{qs.total_questions}")
         if not rows:
             short.append("لم يجب أحد بعد")
@@ -645,7 +647,7 @@ async def group_quiz_resume(message: Message, session):
     uid = message.from_user.id if message.from_user else 0
     if not (_anonymous_admin(message) or await is_chat_admin(message.bot, message.chat.id, uid)):
         return await message.reply("⛔ هذا الأمر للمشرفين فقط.")
-    qs = await _latest_session(session, message.chat.id)
+    qs = await _latest_session(session, message.chat.id, thread_id=getattr(message, "message_thread_id", None))
     if qs is None or qs.status != "paused":
         return await message.reply("لا يوجد اختبار متوقف مؤقتاً.")
     qs.status, qs.paused_at = "active", None
@@ -697,7 +699,10 @@ async def group_quiz_delete(message: Message, session, command: CommandObject):
         quiz_id = int((command.args or "").strip())
     except ValueError:
         return await message.reply("استخدم: /quizdelete رقم_الاختبار")
-    qs_rows = (await session.scalars(select(QuizSession).where(QuizSession.chat_id == message.chat.id, QuizSession.quiz_id == quiz_id))).all()
+    qs_rows = (await session.scalars(select(QuizSession).where(
+        QuizSession.chat_id == message.chat.id, QuizSession.quiz_id == quiz_id))).all()
+    if not qs_rows:
+        return await message.reply("لا توجد جلسة لهذا الاختبار في المجموعة.")
     for qs in qs_rows:
         polls = (await session.scalars(select(QuizSessionPoll).where(QuizSessionPoll.session_id == qs.id))).all()
         for poll in polls:
@@ -710,14 +715,9 @@ async def group_quiz_delete(message: Message, session, command: CommandObject):
                 await message.bot.delete_message(message.chat.id, qs.control_message_id)
             except TelegramAPIError:
                 pass
-    quiz = await session.get(Quiz, quiz_id)
-    if quiz is None:
-        return await message.reply("لم يتم العثور على الاختبار.")
-    if quiz.owner_telegram_id != uid and uid not in settings.owner_ids:
-        return await message.reply("الحذف من مالك الاختبار فقط أو عبر المطوّر.")
-    await session.delete(quiz)
+        await session.delete(qs)
     await session.commit()
-    await message.reply("🗑️ حُذف الاختبار وسجلات رسائله المعروفة.")
+    await message.reply("🗑️ حُذفت جلسة الاختبار ورسائل استطلاعاتها من هذه المجموعة. بقيت نسخة الاختبار المحفوظة متاحة لمالكها.")
 
 
 
