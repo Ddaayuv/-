@@ -39,7 +39,7 @@ log = logging.getLogger(__name__)
 
 GROUP_TYPES = {"group", "supergroup"}
 PRIVATE_DELAY = 0.4   # Telegram allows ~1 message/second to one user
-SHARED_DELAY = 3.2    # ~20 messages/minute in a group or channel
+SHARED_DELAY = 4.0    # leave headroom below Telegram's group rate limit for control/result messages
 MEDALS = ["🥇", "🥈", "🥉"]
 
 _publishing: set[tuple[int, int]] = set()          # chat ids with a publish in progress
@@ -888,7 +888,11 @@ async def group_quiz_export(message: Message, session, command: CommandObject):
         lines.append(f'{i},"{name.replace(chr(34), chr(34)*2)}",{correct},{answered}')
     import io
     doc = BufferedInputFile(("\n".join(lines)).encode("utf-8-sig"), filename=f"quiz-{qs.id}.csv")
-    await message.bot.send_document(message.chat.id, doc, caption=f"نتائج الاختبار #{qs.quiz_id}")
+    try:
+        await message.bot.send_document(uid, doc, caption=f"نتائج الاختبار #{qs.quiz_id}")
+        await message.reply("✅ أرسلت ملف النتائج إلى الخاص.")
+    except TelegramAPIError:
+        await message.reply("افتح محادثة البوت الخاصة واضغط /start، ثم أعد /quizexport لاستلام ملف النتائج بشكل خاص.")
 
 
 
@@ -1024,7 +1028,13 @@ async def bot_membership_changed(event: ChatMemberUpdated):
         if new_status in {"left", "kicked"}:
             if row is not None:
                 row.is_active = False
-                await s.commit()
+            active_sessions = (await s.scalars(select(QuizSession).where(
+                QuizSession.chat_id == chat.id,
+                QuizSession.status.in_(("publishing", "active", "paused"))
+            ))).all()
+            for active in active_sessions:
+                active.status, active.finished_at = "closed", utcnow()
+            await s.commit()
             return
         if new_status not in {"member", "administrator"}:
             return
