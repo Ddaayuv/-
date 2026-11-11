@@ -22,7 +22,7 @@ from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter
 from aiogram.filters import Command, CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import (CallbackQuery, ChatMemberUpdated, InlineKeyboardButton, InlineKeyboardMarkup, Message, PollAnswer)
+from aiogram.types import (BufferedInputFile, CallbackQuery, ChatMemberUpdated, InlineKeyboardButton, InlineKeyboardMarkup, Message, PollAnswer)
 from sqlalchemy import case, func, select, update
 from sqlalchemy.exc import IntegrityError
 
@@ -223,7 +223,7 @@ async def _launch_publish(bot: Bot, quiz_id: int, chat_id: int, kind: str, title
     if kind != "channel":
         async with Session() as s:
             active = await s.scalar(select(QuizSession).where(
-                QuizSession.chat_id == chat_id, (QuizSession.thread_id == thread_id if thread_id is not None else QuizSession.thread_id.is_(None)), QuizSession.status.in_(("publishing", "active"))
+                QuizSession.chat_id == chat_id, (QuizSession.thread_id == thread_id if thread_id is not None else QuizSession.thread_id.is_(None)), QuizSession.status.in_(("publishing", "active", "paused"))
             ).order_by(QuizSession.id.desc()))
             if active:
                 limit = timedelta(hours=1) if active.status == "publishing" else timedelta(hours=24)
@@ -422,9 +422,31 @@ async def session_buttons(cb: CallbackQuery, session):
         if not rows:
             short.append("لم يجب أحد بعد")
         return await cb.answer("\n".join(short)[:190], show_alert=True)
-    if action == "stop":
+    if action in {"stop", "pause", "resume"}:
         if not await is_chat_admin(cb.bot, qs.chat_id, cb.from_user.id):
-            return await cb.answer("⛔ الإنهاء للمشرفين فقط.", show_alert=True)
+            return await cb.answer("⛔ التحكم بالاختبار للمشرفين فقط.", show_alert=True)
+        if action == "pause":
+            if qs.status != "active":
+                return await cb.answer("الاختبار ليس في حالة تشغيل.", show_alert=True)
+            qs.status, qs.paused_at = "paused", utcnow()
+            await session.commit()
+            await cb.answer("تم إيقاف الاختبار مؤقتاً")
+            try:
+                await cb.bot.send_message(qs.chat_id, "⏸ تم إيقاف قبول الإجابات مؤقتاً. يمكن استئنافه من زر التحكم.", message_thread_id=qs.thread_id)
+            except TelegramAPIError:
+                pass
+            return
+        if action == "resume":
+            if qs.status != "paused":
+                return await cb.answer("الاختبار ليس متوقفاً مؤقتاً.", show_alert=True)
+            qs.status, qs.paused_at = "active", None
+            await session.commit()
+            await cb.answer("تم استئناف الاختبار")
+            try:
+                await cb.bot.send_message(qs.chat_id, "▶️ تم استئناف الاختبار.", message_thread_id=qs.thread_id)
+            except TelegramAPIError:
+                pass
+            return
         await cb.answer("جارٍ إنهاء الاختبار…")
         await finish_session(cb.bot, qs.id)
         return
@@ -437,15 +459,146 @@ def _anonymous_admin(message: Message) -> bool:
     return message.sender_chat is not None and message.sender_chat.id == message.chat.id
 
 
+async def _group_settings(session, chat_id: int, title: str = "") -> GroupSettings:
+    row = await session.get(GroupSettings, chat_id)
+    if row is None:
+        row = GroupSettings(chat_id=chat_id, title=(title or "")[:200])
+        session.add(row)
+        await session.flush()
+    elif title:
+        row.title = title[:200]
+    return row
+
+
+async def _can_start_in_group(bot: Bot, chat_id: int, user_id: int, anonymous: bool, cfg: GroupSettings) -> bool:
+    if not cfg.enabled:
+        return False
+    if anonymous:
+        # Telegram hides the real administrator identity. Accept anonymous
+        # admin commands only under the all-admins policy.
+        return cfg.start_policy == "all_admins"
+    if user_id in settings.owner_ids:
+        return True
+    try:
+        member = await bot.get_chat_member(chat_id, user_id)
+    except TelegramAPIError:
+        return False
+    status = status_of(member)
+    if cfg.start_policy == "owner_only":
+        return status == "creator"
+    if status not in {"creator", "administrator"}:
+        return False
+    if cfg.start_policy == "selected":
+        try:
+            allowed = {int(x) for x in json.loads(cfg.allowed_admin_ids_json or "[]")}
+        except (ValueError, TypeError):
+            allowed = set()
+        return user_id in allowed or status == "creator"
+    return True
+
+
+@router.message(Command("quizsettings"), F.chat.type.in_(GROUP_TYPES))
+async def group_quiz_settings(message: Message, session):
+    uid = message.from_user.id if message.from_user else 0
+    if not (_anonymous_admin(message) or await is_chat_admin(message.bot, message.chat.id, uid)):
+        return await message.reply("⛔ إعدادات الاختبار للمشرفين فقط.")
+    cfg = await _group_settings(session, message.chat.id, message.chat.title or "")
+    await session.commit()
+    await message.reply(_group_settings_text(cfg), reply_markup=_group_settings_kb(message.chat.id))
+
+
+def _group_settings_text(cfg: GroupSettings) -> str:
+    policy = {"owner_only": "مالك المجموعة فقط", "all_admins": "كل المشرفين", "selected": "مشرفون محددون"}.get(cfg.start_policy, "كل المشرفين")
+    period = f"{cfg.open_period} ثانية" if cfg.open_period else "بلا مؤقّت"
+    duration = f"{cfg.duration_seconds} ثانية" if cfg.duration_seconds else "بلا مدة كلية"
+    return (f"⚙️ <b>إعدادات الاختبارات</b>\nالحالة: {'مفعّلة' if cfg.enabled else 'معطّلة'}\n"
+            f"من يبدأ: {policy}\nوقت السؤال: {period}\nالمدة الكلية: {duration}\n"
+            f"خلط الأسئلة: {'نعم' if cfg.shuffle_questions else 'لا'} • خلط الخيارات: {'نعم' if cfg.shuffle_options else 'لا'}\n"
+            f"إظهار الشرح: {cfg.explanation_mode} • الترتيب المجهول: {'نعم' if cfg.anonymous_mode else 'لا'}\n"
+            f"عدد الظاهرين: {cfg.leaderboard_limit} • المحاولات: {cfg.max_attempts}")
+
+
+def _group_settings_kb(chat_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="تفعيل/تعطيل", callback_data=f"quizcfg:enabled:{chat_id}"),
+         InlineKeyboardButton(text="سياسة البدء", callback_data=f"quizcfg:policy:{chat_id}")],
+        [InlineKeyboardButton(text="خلط الأسئلة", callback_data=f"quizcfg:shuffleq:{chat_id}"),
+         InlineKeyboardButton(text="خلط الخيارات", callback_data=f"quizcfg:shuffleo:{chat_id}")],
+        [InlineKeyboardButton(text="مؤقّت السؤال", callback_data=f"quizcfg:period:{chat_id}"),
+         InlineKeyboardButton(text="مدة الاختبار", callback_data=f"quizcfg:duration:{chat_id}")],
+        [InlineKeyboardButton(text="إظهار الشرح", callback_data=f"quizcfg:explain:{chat_id}"),
+         InlineKeyboardButton(text="اختبار مجهول", callback_data=f"quizcfg:anonymous:{chat_id}")],
+        [InlineKeyboardButton(text="عدد المتصدرين", callback_data=f"quizcfg:limit:{chat_id}")],
+    ])
+
+
+@router.callback_query(F.data.startswith("quizcfg:"))
+async def group_quiz_settings_callback(cb: CallbackQuery, session):
+    try:
+        _, action, raw_chat = cb.data.split(":")
+        chat_id = int(raw_chat)
+    except (ValueError, TypeError):
+        return await cb.answer("طلب غير صالح.", show_alert=True)
+    if not await is_chat_admin(cb.bot, chat_id, cb.from_user.id):
+        return await cb.answer("⛔ هذه الإعدادات للمشرفين فقط.", show_alert=True)
+    cfg = await _group_settings(session, chat_id)
+    if action == "enabled":
+        cfg.enabled = not cfg.enabled
+    elif action == "policy":
+        cfg.start_policy = {"all_admins": "owner_only", "owner_only": "selected", "selected": "all_admins"}.get(cfg.start_policy, "owner_only")
+    elif action == "shuffleq":
+        cfg.shuffle_questions = not cfg.shuffle_questions
+    elif action == "shuffleo":
+        cfg.shuffle_options = not cfg.shuffle_options
+    elif action == "period":
+        cfg.open_period = {None: 30, 30: 60, 60: 0}.get(cfg.open_period, 30) or None
+    elif action == "duration":
+        cfg.duration_seconds = {None: 600, 600: 1800, 1800: 3600, 3600: 0}.get(cfg.duration_seconds, 600) or None
+    elif action == "explain":
+        cfg.explanation_mode = "end" if cfg.explanation_mode == "after" else "after"
+    elif action == "anonymous":
+        cfg.anonymous_mode = not cfg.anonymous_mode
+    elif action == "limit":
+        cfg.leaderboard_limit = {5: 10, 10: 20, 20: 5}.get(cfg.leaderboard_limit, 10)
+    else:
+        return await cb.answer("إعداد غير معروف.", show_alert=True)
+    await session.commit()
+    await cb.message.edit_text(_group_settings_text(cfg), reply_markup=_group_settings_kb(chat_id))
+    await cb.answer("تم حفظ الإعدادات")
+
+
+@router.message(Command("quizallow"), F.chat.type.in_(GROUP_TYPES))
+async def group_quiz_allow_admin(message: Message, session, command: CommandObject):
+    uid = message.from_user.id if message.from_user else 0
+    if not await is_chat_admin(message.bot, message.chat.id, uid):
+        return await message.reply("⛔ مالك المجموعة أو مشرف مخوّل فقط.")
+    try:
+        target_id = int((command.args or "").strip())
+    except ValueError:
+        return await message.reply("استخدم: /quizallow رقم_المستخدم")
+    cfg = await _group_settings(session, message.chat.id, message.chat.title or "")
+    try:
+        ids = {int(x) for x in json.loads(cfg.allowed_admin_ids_json or "[]")}
+    except (ValueError, TypeError):
+        ids = set()
+    ids.add(target_id)
+    cfg.allowed_admin_ids_json = json.dumps(sorted(ids))
+    cfg.start_policy = "selected"
+    await session.commit()
+    await message.reply(f"✅ أُضيف المستخدم {target_id} إلى قائمة المشرفين المسموح لهم.")
+
+
 @router.message(Command("quiz"), F.chat.type.in_(GROUP_TYPES))
 async def group_quiz(message: Message, command: CommandObject, session):
     bot, uid = message.bot, (message.from_user.id if message.from_user else 0)
-    if not (_anonymous_admin(message) or await is_chat_admin(bot, message.chat.id, uid)):
-        return await message.reply("⛔ هذا الأمر لمشرفي المجموعة فقط.")
+    anonymous = _anonymous_admin(message)
+    cfg = await _group_settings(session, message.chat.id, message.chat.title or "")
+    if not await _can_start_in_group(bot, message.chat.id, uid, anonymous, cfg):
+        return await message.reply("⛔ لا تملك صلاحية بدء الاختبار أو أن ميزة الاختبارات معطّلة. استخدم /quizsettings للمراجعة.")
     args = (command.args or "").strip()
     if args.isdigit():
         quiz = await session.get(Quiz, int(args))
-        if quiz is None or _anonymous_admin(message) or (quiz.owner_telegram_id != uid and uid not in settings.owner_ids):
+        if quiz is None or anonymous or (quiz.owner_telegram_id != uid and uid not in settings.owner_ids):
             return await message.reply("لا أجد اختباراً بهذا الرقم يخصّ حسابك. (لا يعمل مع حساب المشرف المجهول)")
     else:
         reply = message.reply_to_message
@@ -457,12 +610,158 @@ async def group_quiz(message: Message, command: CommandObject, session):
             return await message.reply(_problems_text(parsed)[:3900])
         quiz = await _save_quiz(session, uid, source, parsed)
     chat = message.chat
-    error = await _launch_publish(bot, quiz.id, chat.id, "group", chat.title or "", uid, chat.id)
+    thread_id = getattr(message, "message_thread_id", None)
+    error = await _launch_publish(bot, quiz.id, chat.id, "group", chat.title or "", uid, chat.id, thread_id)
     if error:
         return await message.reply(error)
     minutes = max(1, round(len(quiz.questions) * SHARED_DELAY / 60))
     await message.reply(f"⏳ سأنشر {len(quiz.questions)} سؤالاً (نحو {minutes} دقيقة بسبب حدود تيليجرام). "
                         "يمكنكم الإجابة مباشرة أثناء النشر.")
+
+
+@router.message(Command("quizpause"), F.chat.type.in_(GROUP_TYPES))
+async def group_quiz_pause(message: Message, session):
+    uid = message.from_user.id if message.from_user else 0
+    if not (_anonymous_admin(message) or await is_chat_admin(message.bot, message.chat.id, uid)):
+        return await message.reply("⛔ هذا الأمر للمشرفين فقط.")
+    qs = await _latest_session(session, message.chat.id, only_active=True)
+    if qs is None or qs.status != "active":
+        return await message.reply("لا يوجد اختبار نشط قابل للإيقاف.")
+    qs.status, qs.paused_at = "paused", utcnow()
+    await session.commit()
+    await message.reply("⏸ تم إيقاف قبول الإجابات مؤقتاً.")
+
+
+@router.message(Command("quizresume"), F.chat.type.in_(GROUP_TYPES))
+async def group_quiz_resume(message: Message, session):
+    uid = message.from_user.id if message.from_user else 0
+    if not (_anonymous_admin(message) or await is_chat_admin(message.bot, message.chat.id, uid)):
+        return await message.reply("⛔ هذا الأمر للمشرفين فقط.")
+    qs = await _latest_session(session, message.chat.id)
+    if qs is None or qs.status != "paused":
+        return await message.reply("لا يوجد اختبار متوقف مؤقتاً.")
+    qs.status, qs.paused_at = "active", None
+    await session.commit()
+    await message.reply("▶️ تم استئناف الاختبار.")
+
+
+@router.message(Command("quizstop"), F.chat.type.in_(GROUP_TYPES))
+async def group_quiz_stop(message: Message, session):
+    uid = message.from_user.id if message.from_user else 0
+    if not (_anonymous_admin(message) or await is_chat_admin(message.bot, message.chat.id, uid)):
+        return await message.reply("⛔ هذا الأمر لمشرفي المجموعة فقط.")
+    qs = await _latest_session(session, message.chat.id, only_active=True)
+    if qs is None:
+        return await message.reply("لا يوجد اختبار نشط في هذه المجموعة.")
+    await finish_session(message.bot, qs.id)
+
+
+@router.message(Command("quizresults"), F.chat.type.in_(GROUP_TYPES))
+async def group_quiz_results(message: Message, session):
+    qs = await _latest_session(session, message.chat.id)
+    if qs is None:
+        return await message.reply("لم يُنشر أي اختبار في هذه المجموعة بعد.")
+    rows = await _leaderboard(session, qs.id)
+    cfg = json.loads(qs.settings_json or "{}")
+    await message.reply(_format_board(rows, qs.quiz_id, qs.total_questions,
+        limit=int(cfg.get("leaderboard_limit", 10)), anonymous=bool(cfg.get("anonymous_mode", False)),
+        final=qs.status == "closed"), message_thread_id=qs.thread_id)
+
+
+@router.message(Command("quizhistory"), F.chat.type.in_(GROUP_TYPES))
+async def group_quiz_history(message: Message, session):
+    rows = (await session.scalars(select(QuizSession).where(QuizSession.chat_id == message.chat.id)
+        .order_by(QuizSession.id.desc()).limit(10))).all()
+    if not rows:
+        return await message.reply("لا يوجد سجل اختبارات بعد.")
+    lines = ["📚 <b>سجل الاختبارات</b>"]
+    for row in rows:
+        lines.append(f"#{row.quiz_id} — {row.status} — {row.started_at:%Y-%m-%d %H:%M}")
+    await message.reply("\n".join(lines))
+
+
+@router.message(Command("quizdelete"), F.chat.type.in_(GROUP_TYPES))
+async def group_quiz_delete(message: Message, session, command: CommandObject):
+    uid = message.from_user.id if message.from_user else 0
+    if not (_anonymous_admin(message) or await is_chat_admin(message.bot, message.chat.id, uid)):
+        return await message.reply("⛔ الحذف للمشرفين فقط.")
+    try:
+        quiz_id = int((command.args or "").strip())
+    except ValueError:
+        return await message.reply("استخدم: /quizdelete رقم_الاختبار")
+    qs_rows = (await session.scalars(select(QuizSession).where(QuizSession.chat_id == message.chat.id, QuizSession.quiz_id == quiz_id))).all()
+    for qs in qs_rows:
+        polls = (await session.scalars(select(QuizSessionPoll).where(QuizSessionPoll.session_id == qs.id))).all()
+        for poll in polls:
+            try:
+                await message.bot.delete_message(message.chat.id, poll.message_id)
+            except TelegramAPIError:
+                pass
+        if qs.control_message_id:
+            try:
+                await message.bot.delete_message(message.chat.id, qs.control_message_id)
+            except TelegramAPIError:
+                pass
+    quiz = await session.get(Quiz, quiz_id)
+    if quiz is None:
+        return await message.reply("لم يتم العثور على الاختبار.")
+    if quiz.owner_telegram_id != uid and uid not in settings.owner_ids:
+        return await message.reply("الحذف من مالك الاختبار فقط أو عبر المطوّر.")
+    await session.delete(quiz)
+    await session.commit()
+    await message.reply("🗑️ حُذف الاختبار وسجلات رسائله المعروفة.")
+
+
+@router.message(Command("quizschedule"), F.chat.type.in_(GROUP_TYPES))
+async def group_quiz_schedule(message: Message, command: CommandObject, session):
+    uid = message.from_user.id if message.from_user else 0
+    if not await is_chat_admin(message.bot, message.chat.id, uid):
+        return await message.reply("⛔ الجدولة للمشرفين فقط.")
+    parts = (command.args or "").split()
+    if len(parts) not in {3, 4}:
+        return await message.reply("استخدم: /quizschedule رقم_الاختبار YYYY-MM-DD HH:MM [daily|weekly]")
+    try:
+        quiz_id = int(parts[0])
+        local = datetime.strptime(parts[1] + " " + parts[2], "%Y-%m-%d %H:%M")
+        repeat = parts[3].lower() if len(parts) == 4 else "none"
+        if repeat not in {"none", "daily", "weekly"}:
+            raise ValueError
+    except ValueError:
+        return await message.reply("صيغة التاريخ أو التكرار غير صحيحة.")
+    quiz = await session.get(Quiz, quiz_id)
+    if quiz is None or (quiz.owner_telegram_id != uid and uid not in settings.owner_ids):
+        return await message.reply("الاختبار غير موجود أو ليس ملكك.")
+    cfg = await _group_settings(session, message.chat.id, message.chat.title or "")
+    local = local.replace(tzinfo=ZoneInfo(cfg.timezone))
+    utc = local.astimezone(timezone.utc).replace(tzinfo=None)
+    if utc <= utcnow():
+        return await message.reply("موعد الجدولة يجب أن يكون في المستقبل.")
+    session.add(GroupQuizSchedule(chat_id=message.chat.id, quiz_id=quiz_id,
+        thread_id=getattr(message, "message_thread_id", None), requested_by=uid,
+        run_at=utc, repeat_mode=repeat, timezone=cfg.timezone))
+    await session.commit()
+    await message.reply(f"✅ تمت جدولة الاختبار #{quiz_id} بتاريخ {local:%Y-%m-%d %H:%M} ({cfg.timezone}).")
+
+
+@router.message(Command("quizexport"), F.chat.type.in_(GROUP_TYPES))
+async def group_quiz_export(message: Message, session, command: CommandObject):
+    uid = message.from_user.id if message.from_user else 0
+    if not await is_chat_admin(message.bot, message.chat.id, uid):
+        return await message.reply("⛔ تصدير النتائج للمشرفين فقط.")
+    qs = await _latest_session(session, message.chat.id)
+    if qs is None:
+        return await message.reply("لا توجد نتائج.")
+    rows = await _leaderboard(session, qs.id)
+    lines = ["الترتيب,الاسم,الصحيحة,المجاب"]
+    for i, (_user, name, correct, answered) in enumerate(rows, 1):
+        lines.append(f'{i},"{name.replace(chr(34), chr(34)*2)}",{correct},{answered}')
+    import io
+    doc = BufferedInputFile(("\n".join(lines)).encode("utf-8-sig"), filename=f"quiz-{qs.id}.csv")
+    await message.bot.send_document(message.chat.id, doc, caption=f"نتائج الاختبار #{qs.quiz_id}")
+
+
+@router.my_chat_member()
+async def bot_membership_changed(event: ChatMemberUpdated):
 
 
 @router.message(Command("quizstop"), F.chat.type.in_(GROUP_TYPES))
