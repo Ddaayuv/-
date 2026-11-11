@@ -988,10 +988,6 @@ async def group_migrated(message: Message):
         log.warning("Could not announce chat migration old=%s new=%s", old_chat_id, new_chat_id)
 
 
-@router.my_chat_member()
-async def bot_membership_changed(event: ChatMemberUpdated):
-
-
 @router.message(Command("quizstop"), F.chat.type.in_(GROUP_TYPES))
 async def group_quiz_stop(message: Message, session):
     uid = message.from_user.id if message.from_user else 0
