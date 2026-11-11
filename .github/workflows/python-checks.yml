@@ -17,3 +17,10 @@ jobs:
       - run: pip install -r requirements-dev.txt
       - run: python -m compileall -q bot tests
       - run: python -m pytest -q
+      - name: Package source ZIP
+        run: zip -r group-quiz-controls.zip . -x ".git/*" ".env" "*/__pycache__/*" ".pytest_cache/*"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: group-quiz-controls
+          path: group-quiz-controls.zip
+          retention-days: 7
