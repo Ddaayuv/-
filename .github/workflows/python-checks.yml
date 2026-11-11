@@ -18,7 +18,7 @@ jobs:
       - run: python -m compileall -q bot tests
       - run: python -m pytest -q
       - name: Package source ZIP
-        run: zip -r group-quiz-controls.zip . -x ".git/*" ".env" "*/__pycache__/*" ".pytest_cache/*"
+        run: zip -r group-quiz-controls.zip . -x ".git/*" ".env" "group-quiz-controls.zip" "*/__pycache__/*" ".pytest_cache/*"
       - uses: actions/upload-artifact@v4
         with:
           name: group-quiz-controls
