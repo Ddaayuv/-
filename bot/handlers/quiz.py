@@ -364,8 +364,10 @@ def _format_board(rows, quiz_id: int, total: int, limit: int = 10, *, final: boo
     return "\n".join(lines)
 
 
-async def _latest_session(session, chat_id: int, only_active: bool = False):
+async def _latest_session(session, chat_id: int, only_active: bool = False, thread_id: int | None = None):
     q = select(QuizSession).where(QuizSession.chat_id == chat_id)
+    if thread_id is not None:
+        q = q.where(QuizSession.thread_id == thread_id)
     if only_active:
         q = q.where(QuizSession.status.in_(("publishing", "active")))
     return await session.scalar(q.order_by(QuizSession.id.desc()))
@@ -624,7 +626,7 @@ async def group_quiz_pause(message: Message, session):
     uid = message.from_user.id if message.from_user else 0
     if not (_anonymous_admin(message) or await is_chat_admin(message.bot, message.chat.id, uid)):
         return await message.reply("⛔ هذا الأمر للمشرفين فقط.")
-    qs = await _latest_session(session, message.chat.id, only_active=True)
+    qs = await _latest_session(session, message.chat.id, only_active=True, thread_id=getattr(message, "message_thread_id", None))
     if qs is None or qs.status != "active":
         return await message.reply("لا يوجد اختبار نشط قابل للإيقاف.")
     qs.status, qs.paused_at = "paused", utcnow()
@@ -650,7 +652,7 @@ async def group_quiz_stop(message: Message, session):
     uid = message.from_user.id if message.from_user else 0
     if not (_anonymous_admin(message) or await is_chat_admin(message.bot, message.chat.id, uid)):
         return await message.reply("⛔ هذا الأمر لمشرفي المجموعة فقط.")
-    qs = await _latest_session(session, message.chat.id, only_active=True)
+    qs = await _latest_session(session, message.chat.id, only_active=True, thread_id=getattr(message, "message_thread_id", None))
     if qs is None:
         return await message.reply("لا يوجد اختبار نشط في هذه المجموعة.")
     await finish_session(message.bot, qs.id)
@@ -658,7 +660,7 @@ async def group_quiz_stop(message: Message, session):
 
 @router.message(Command("quizresults"), F.chat.type.in_(GROUP_TYPES))
 async def group_quiz_results(message: Message, session):
-    qs = await _latest_session(session, message.chat.id)
+    qs = await _latest_session(session, message.chat.id, thread_id=getattr(message, "message_thread_id", None))
     if qs is None:
         return await message.reply("لم يُنشر أي اختبار في هذه المجموعة بعد.")
     rows = await _leaderboard(session, qs.id)
@@ -748,7 +750,7 @@ async def group_quiz_export(message: Message, session, command: CommandObject):
     uid = message.from_user.id if message.from_user else 0
     if not await is_chat_admin(message.bot, message.chat.id, uid):
         return await message.reply("⛔ تصدير النتائج للمشرفين فقط.")
-    qs = await _latest_session(session, message.chat.id)
+    qs = await _latest_session(session, message.chat.id, thread_id=getattr(message, "message_thread_id", None))
     if qs is None:
         return await message.reply("لا توجد نتائج.")
     rows = await _leaderboard(session, qs.id)
@@ -760,6 +762,96 @@ async def group_quiz_export(message: Message, session, command: CommandObject):
     await message.bot.send_document(message.chat.id, doc, caption=f"نتائج الاختبار #{qs.quiz_id}")
 
 
+
+async def quiz_maintenance_loop(bot: Bot):
+    """Recover interrupted sessions and run durable group schedules/auto-expiry."""
+    async with Session() as s:
+        interrupted = (await s.scalars(select(QuizSession).where(QuizSession.status == "publishing"))).all()
+        for qs in interrupted:
+            count = await s.scalar(select(func.count(QuizSessionPoll.poll_id)).where(QuizSessionPoll.session_id == qs.id)) or 0
+            qs.status = "active" if count else "failed"
+            if not count:
+                qs.finished_at = utcnow()
+        await s.commit()
+    while True:
+        try:
+            now = utcnow()
+            async with Session() as s:
+                due = (await s.scalars(select(GroupQuizSchedule).where(
+                    GroupQuizSchedule.is_active.is_(True), GroupQuizSchedule.run_at <= now
+                ).order_by(GroupQuizSchedule.run_at).limit(20))).all()
+                due_data = [(x.id, x.chat_id, x.quiz_id, x.thread_id, x.requested_by, x.repeat_mode) for x in due]
+                expired = (await s.scalars(select(QuizSession).where(
+                    QuizSession.status.in_(("active", "paused")), QuizSession.ends_at.is_not(None),
+                    QuizSession.ends_at <= now
+                ))).all()
+                expired_ids = [x.id for x in expired]
+                for item in due:
+                    if item.repeat_mode == "none":
+                        item.is_active = False
+                    else:
+                        item.run_at = item.run_at + timedelta(days=1 if item.repeat_mode == "daily" else 7)
+                    item.last_run_at = now
+                await s.commit()
+            for session_id in expired_ids:
+                await finish_session(bot, session_id)
+            for _sid, chat_id, quiz_id, thread_id, requester, _repeat in due_data:
+                async with Session() as s:
+                    target = await s.scalar(select(QuizTarget).where(QuizTarget.chat_id == chat_id))
+                    quiz = await s.get(Quiz, quiz_id)
+                    cfg = await s.get(GroupSettings, chat_id)
+                    if not target or not target.is_active or not quiz or (cfg and not cfg.enabled):
+                        continue
+                    error = await _launch_publish(bot, quiz_id, chat_id, target.kind, target.title or "",
+                                                  requester, chat_id, thread_id)
+                    if error:
+                        log.info("Scheduled quiz %s was not launched: %s", quiz_id, error)
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("group quiz maintenance loop failed")
+            await asyncio.sleep(30)
+
+
+async def recover_group_quiz_sessions(bot: Bot):
+    """Close sessions that have remained active for more than 24 hours."""
+    cutoff = utcnow() - timedelta(hours=24)
+    async with Session() as s:
+        stale = (await s.scalars(select(QuizSession).where(
+            QuizSession.status.in_(("active", "paused")), QuizSession.started_at < cutoff
+        ))).all()
+        ids = [x.id for x in stale]
+    for session_id in ids:
+        await finish_session(bot, session_id)
+
+
+@router.message(F.migrate_to_chat_id)
+async def group_migrated(message: Message):
+    old_chat_id = message.chat.id
+    new_chat_id = message.migrate_to_chat_id
+    async with Session() as s:
+        target = await s.scalar(select(QuizTarget).where(QuizTarget.chat_id == old_chat_id))
+        existing_target = await s.scalar(select(QuizTarget).where(QuizTarget.chat_id == new_chat_id))
+        if target and existing_target:
+            target.is_active = False
+        elif target:
+            target.chat_id = new_chat_id
+        group_cfg = await s.get(GroupSettings, old_chat_id)
+        existing_cfg = await s.get(GroupSettings, new_chat_id)
+        if group_cfg and existing_cfg is None:
+            group_cfg.chat_id = new_chat_id
+        elif group_cfg and existing_cfg:
+            existing_cfg.enabled = existing_cfg.enabled and group_cfg.enabled
+        await s.execute(update(QuizSession).where(QuizSession.chat_id == old_chat_id).values(chat_id=new_chat_id))
+        await s.execute(update(GroupQuizSchedule).where(GroupQuizSchedule.chat_id == old_chat_id).values(chat_id=new_chat_id))
+        await s.commit()
+    try:
+        await message.bot.send_message(new_chat_id, "✅ تم تحديث ربط الاختبارات بعد تحويل المجموعة إلى سوبرغروب. استخدموا /quiz لبدء اختبار جديد.")
+    except TelegramAPIError:
+        log.warning("Could not announce chat migration old=%s new=%s", old_chat_id, new_chat_id)
+
+
 @router.my_chat_member()
 async def bot_membership_changed(event: ChatMemberUpdated):
 
@@ -769,7 +861,7 @@ async def group_quiz_stop(message: Message, session):
     uid = message.from_user.id if message.from_user else 0
     if not (_anonymous_admin(message) or await is_chat_admin(message.bot, message.chat.id, uid)):
         return await message.reply("⛔ هذا الأمر لمشرفي المجموعة فقط.")
-    qs = await _latest_session(session, message.chat.id, only_active=True)
+    qs = await _latest_session(session, message.chat.id, only_active=True, thread_id=getattr(message, "message_thread_id", None))
     if qs is None:
         return await message.reply("لا يوجد اختبار نشط في هذه المجموعة.")
     await finish_session(message.bot, qs.id)
@@ -814,7 +906,12 @@ async def bot_membership_changed(event: ChatMemberUpdated):
         note = "\n⚠️ للنشر في القناة يجب أن يكون البوت <b>مشرفاً</b> بصلاحية نشر الرسائل."
     elif ctype == "channel" and getattr(event.new_chat_member, "can_post_messages", None) is False:
         note = "\n⚠️ البوت مشرف لكن بلا صلاحية «نشر الرسائل»؛ فعّلها له."
-    hint = "اكتب /quiz داخل المجموعة" if ctype in GROUP_TYPES else "افتح «🤖 إنشاء اختبار» هنا"
+    hint = "اكتب /quiz داخل المجموعة، أو /quizsettings لضبط الاختبار. الصلاحيات المطلوبة: إرسال الرسائل والاستطلاعات." if ctype in GROUP_TYPES else "افتح «🤖 إنشاء اختبار» هنا"
+    if ctype in GROUP_TYPES:
+        try:
+            await event.bot.send_message(chat.id, "👋 أهلاً! أستطيع تشغيل اختبارات داخل هذه المجموعة.\nللمشرف: /quiz ثم أرسل الأسئلة، أو /quiz ردّاً على رسالة الأسئلة.\nالإعدادات: /quizsettings • النتائج: /quizresults • الإنهاء: /quizstop\nأحتاج صلاحية إرسال الرسائل والاستطلاعات. ولحذف رسائل الاختبار امنحني حذف الرسائل أيضاً.")
+        except TelegramAPIError:
+            log.warning("Could not send welcome message to chat=%s", chat.id)
     if adder:
         try:
             await event.bot.send_message(adder, f"✅ ربطتُ «{esc(chat.title or '')}» بالبوت لنشر الاختبارات. {hint}.{note}")
