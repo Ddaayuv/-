@@ -28,6 +28,13 @@ class ThrottleMiddleware(BaseMiddleware):
         self.last[uid]=now; return await handler(event,data)
 class MembershipMiddleware(BaseMiddleware):
     async def __call__(self,handler,event,data):
+        # Force-subscription is a private-user onboarding rule. Never gate
+        # group messages/callbacks or poll participation on a member's channel status.
+        event_chat = getattr(event, "chat", None)
+        if event_chat is None:
+            event_chat = getattr(getattr(event, "message", None), "chat", None)
+        if event_chat is not None and str(getattr(event_chat.type, "value", event_chat.type)) != "private":
+            return await handler(event, data)
         user=getattr(event,"from_user",None); uid=getattr(user,"id",None)
         if not uid or uid in settings.owner_ids:return await handler(event,data)
         session:AsyncSession=data.get("session")
