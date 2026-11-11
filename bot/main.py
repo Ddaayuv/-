@@ -5,13 +5,14 @@ from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import BotCommand, BotCommandScopeChat, BotCommandScopeDefault
+from aiogram.types import BotCommand, BotCommandScopeAllGroupChats, BotCommandScopeChat, BotCommandScopeDefault
 
 from .backup import backup_loop
 from .config import runtime, settings
 from .db import Session, db_counts, init_db
 from .handlers import admin, user, quiz
 from .middlewares import DbMiddleware, MembershipMiddleware, ThrottleMiddleware
+from .handlers.quiz import quiz_maintenance_loop, recover_group_quiz_sessions
 
 
 async def main() -> None:
@@ -40,10 +41,23 @@ async def main() -> None:
             BotCommand(command="search", description="بحث في المحاضرات"),
             BotCommand(command="myquizzes", description="اختباراتي المحفوظة"),
         ]
+        group_commands = [
+            BotCommand(command="quiz", description="بدء اختبار (للمشرفين)"),
+            BotCommand(command="quizsettings", description="إعدادات اختبارات المجموعة"),
+            BotCommand(command="quizpause", description="إيقاف الاختبار مؤقتاً"),
+            BotCommand(command="quizresume", description="استئناف الاختبار"),
+            BotCommand(command="quizstop", description="إنهاء الاختبار"),
+            BotCommand(command="quizresults", description="عرض الترتيب"),
+            BotCommand(command="quizhistory", description="سجل الاختبارات"),
+            BotCommand(command="quizexport", description="تصدير النتائج"),
+            BotCommand(command="quizschedule", description="جدولة اختبار"),
+        ]
+        await bot.set_my_commands(group_commands, scope=BotCommandScopeAllGroupChats())
         await bot.set_my_commands(public_commands, scope=BotCommandScopeDefault())
         owner_commands = public_commands + [
             BotCommand(command="adminpanel", description="لوحة المطوّر"),
             BotCommand(command="broadcast", description="إذاعة رسالة للمستخدمين"),
+            BotCommand(command="quizgroups", description="إدارة مجموعات الاختبارات"),
         ]
         for owner_id in settings.owner_ids:
             try:
@@ -60,16 +74,20 @@ async def main() -> None:
                     await bot.send_message(owner_id, "⚠️ قاعدة البيانات فارغة عند التشغيل. إذا كان عندك محتوى سابق فالتخزين غير دائم: فعّل Volume على Railway (DB_PATH=/app/data/bot.db) أو استخدم PostgreSQL عبر DATABASE_URL، ثم استرجع آخر نسخة بالأمر /restore.")
                 except Exception:
                     pass
+        await recover_group_quiz_sessions(bot)
         backup_task = asyncio.create_task(backup_loop(bot), name="daily-backup")
+        quiz_task = asyncio.create_task(quiz_maintenance_loop(bot), name="group-quiz-maintenance")
         logging.info("Bot @%s started; polling Telegram updates", runtime["bot_username"])
         try:
             await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
         finally:
-            backup_task.cancel()
-            try:
-                await backup_task
-            except asyncio.CancelledError:
-                pass
+            for task in (backup_task, quiz_task):
+                task.cancel()
+            for task in (backup_task, quiz_task):
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
     finally:
         await bot.session.close()
 
