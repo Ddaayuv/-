@@ -13,7 +13,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from datetime import timedelta
+import random
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter
@@ -26,7 +28,7 @@ from sqlalchemy.exc import IntegrityError
 
 from ..config import settings
 from ..db import (Quiz, QuizAttempt, QuizPoll, QuizQuestion, QuizResponse, QuizSession, QuizSessionAnswer,
-                  QuizSessionPoll, QuizTarget, Session, audit, utcnow)
+                  QuizSessionPoll, QuizTarget, GroupSettings, GroupQuizSchedule, Session, audit, utcnow)
 from ..membership import inspect_channel, status_of
 from ..quiz_parser import MAX_EXPLANATION, parse_quiz_text
 from ..utils import esc, parse_chat_ref
@@ -143,8 +145,10 @@ def _poll_payload(question: QuizQuestion, total: int, anonymous: bool) -> dict:
     return payload
 
 
-async def _send_poll(bot: Bot, chat_id: int, payload: dict) -> Message:
+async def _send_poll(bot: Bot, chat_id: int, payload: dict, *, thread_id: int | None = None) -> Message:
     """send_poll that waits out Telegram flood limits instead of failing the whole quiz."""
+    if thread_id is not None:
+        payload = {**payload, "message_thread_id": thread_id}
     for _ in range(5):
         try:
             return await bot.send_poll(chat_id=chat_id, **payload)
@@ -212,14 +216,14 @@ async def is_chat_admin(bot: Bot, chat_id: int, user_id: int) -> bool:
 
 
 async def _launch_publish(bot: Bot, quiz_id: int, chat_id: int, kind: str, title: str,
-                          started_by: int, notify_chat_id: int) -> str | None:
+                          started_by: int, notify_chat_id: int, thread_id: int | None = None) -> str | None:
     """Starts publishing in the background. Returns an error text if it cannot start."""
     if chat_id in _publishing:
         return "⏳ هناك نشر جارٍ الآن في هذه الوجهة. انتظر حتى ينتهي."
     if kind != "channel":
         async with Session() as s:
             active = await s.scalar(select(QuizSession).where(
-                QuizSession.chat_id == chat_id, QuizSession.status.in_(("publishing", "active"))
+                QuizSession.chat_id == chat_id, (QuizSession.thread_id == thread_id if thread_id is not None else QuizSession.thread_id.is_(None)), QuizSession.status.in_(("publishing", "active"))
             ).order_by(QuizSession.id.desc()))
             if active:
                 limit = timedelta(hours=1) if active.status == "publishing" else timedelta(hours=24)
@@ -229,15 +233,15 @@ async def _launch_publish(bot: Bot, quiz_id: int, chat_id: int, kind: str, title
                 else:
                     return f"يوجد اختبار نشط في هذه المجموعة (#{active.quiz_id}). أنهِه أولاً بالأمر /quizstop"
     _publishing.add(chat_id)
-    task = asyncio.create_task(_publish_task(bot, quiz_id, chat_id, kind, title, started_by, notify_chat_id))
+    task = asyncio.create_task(_publish_task(bot, quiz_id, chat_id, kind, title, started_by, notify_chat_id, thread_id))
     _tasks.add(task)
     task.add_done_callback(_tasks.discard)
     return None
 
 
-async def _publish_task(bot, quiz_id, chat_id, kind, title, started_by, notify_chat_id) -> None:
+async def _publish_task(bot, quiz_id, chat_id, kind, title, started_by, notify_chat_id, thread_id=None) -> None:
     try:
-        await _publish_to_chat(bot, quiz_id, chat_id, kind, title, started_by, notify_chat_id)
+        await _publish_to_chat(bot, quiz_id, chat_id, kind, title, started_by, notify_chat_id, thread_id)
     except Exception:
         log.exception("quiz publish crashed (chat=%s)", chat_id)
         try:
@@ -249,7 +253,7 @@ async def _publish_task(bot, quiz_id, chat_id, kind, title, started_by, notify_c
 
 
 async def _publish_to_chat(bot: Bot, quiz_id: int, chat_id: int, kind: str, title: str,
-                           started_by: int, notify_chat_id: int) -> None:
+                           started_by: int, notify_chat_id: int, thread_id: int | None = None) -> None:
     is_channel = kind == "channel"
     async with Session() as session:
         quiz = await session.get(Quiz, quiz_id)
@@ -257,16 +261,39 @@ async def _publish_to_chat(bot: Bot, quiz_id: int, chat_id: int, kind: str, titl
             await bot.send_message(notify_chat_id, "❌ الاختبار غير موجود أو بلا أسئلة.")
             return
         questions = list(quiz.questions)
+        group_settings = await session.get(GroupSettings, chat_id) if not is_channel else None
+        snapshot = {}
+        if group_settings is not None:
+            snapshot = {"shuffle_questions": group_settings.shuffle_questions, "shuffle_options": group_settings.shuffle_options,
+                        "anonymous_mode": group_settings.anonymous_mode, "explanation_mode": group_settings.explanation_mode,
+                        "leaderboard_limit": group_settings.leaderboard_limit}
+        if snapshot.get("shuffle_questions"):
+            random.shuffle(questions)
         qs = None
         if not is_channel:
             qs = QuizSession(quiz_id=quiz.id, chat_id=chat_id, chat_title=title[:200], started_by=started_by,
+                             thread_id=thread_id, settings_json=json.dumps(snapshot, ensure_ascii=False),
+                             ends_at=(utcnow() + timedelta(seconds=group_settings.duration_seconds)) if group_settings and group_settings.duration_seconds else None,
                              total_questions=len(questions), status="publishing")
             session.add(qs)
             await session.commit()
         sent, failure = 0, ""
         for question in questions:
             try:
-                message = await _send_poll(bot, chat_id, _poll_payload(question, len(questions), anonymous=is_channel))
+                options = json.loads(question.options_json)
+                order = list(range(len(options)))
+                if group_settings and group_settings.shuffle_options:
+                    random.shuffle(order)
+                correct_index = order.index(question.correct_option_index)
+                view = type("QuestionView", (), {"number": sent + 1, "question": question.question,
+                    "options_json": json.dumps([options[i] for i in order], ensure_ascii=False),
+                    "correct_option_index": correct_index, "explanation": question.explanation})()
+                payload = _poll_payload(view, len(questions), anonymous=is_channel)
+                if group_settings and group_settings.open_period:
+                    payload["open_period"] = group_settings.open_period
+                if group_settings and group_settings.explanation_mode == "end":
+                    payload.pop("explanation", None); payload.pop("explanation_parse_mode", None)
+                message = await _send_poll(bot, chat_id, payload, thread_id=thread_id)
             except Exception as exc:
                 failure = _publish_error(exc)
                 log.warning("quiz publish to %s stopped at question %s: %s", chat_id, question.number, exc)
@@ -274,7 +301,7 @@ async def _publish_to_chat(bot: Bot, quiz_id: int, chat_id: int, kind: str, titl
             sent += 1
             if qs is not None:
                 session.add(QuizSessionPoll(poll_id=message.poll.id, session_id=qs.id, question_number=question.number,
-                                            correct_option_index=question.correct_option_index, message_id=message.message_id))
+                                            correct_option_index=correct_index, message_id=message.message_id))
                 await session.commit()
             await asyncio.sleep(SHARED_DELAY)
         if qs is not None:
@@ -283,11 +310,13 @@ async def _publish_to_chat(bot: Bot, quiz_id: int, chat_id: int, kind: str, titl
             await session.commit()
             if sent:
                 control = await bot.send_message(
-                    chat_id,
-                    f"🏁 <b>اختبار #{quiz.id}</b> — {sent} سؤال\nأجيبوا عن الاستطلاعات أعلاه. المشرف يضغط «إنهاء» لإعلان الترتيب.",
+                    chat_id, f"🏁 <b>اختبار #{quiz.id}</b> — {sent} سؤال\nأجيبوا عن الاستطلاعات أعلاه. استخدموا أزرار التحكم.",
+                    message_thread_id=thread_id,
                     reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
                         InlineKeyboardButton(text="📊 الترتيب الحالي", callback_data=f"quizs:board:{qs.id}"),
-                        InlineKeyboardButton(text="🏁 إنهاء الاختبار", callback_data=f"quizs:stop:{qs.id}")]]))
+                        InlineKeyboardButton(text="⏸ إيقاف مؤقت", callback_data=f"quizs:pause:{qs.id}"),
+                        InlineKeyboardButton(text="▶️ استئناف", callback_data=f"quizs:resume:{qs.id}"),
+                        InlineKeyboardButton(text="🏁 إنهاء", callback_data=f"quizs:stop:{qs.id}")]]))
                 qs.control_message_id = control.message_id
                 await session.commit()
         await audit(session, started_by, "quiz_publish", f"quiz#{quiz.id} -> {chat_id} ({kind}) sent={sent}/{len(questions)}")
@@ -319,13 +348,15 @@ async def _leaderboard(session, session_id: int) -> list[tuple[int, str, int, in
     return [(uid, name or "مجهول", int(c or 0), int(n or 0)) for uid, name, c, n in rows]
 
 
-def _format_board(rows, quiz_id: int, total: int, limit: int = 10, *, final: bool = False) -> str:
+def _format_board(rows, quiz_id: int, total: int, limit: int = 10, *, final: bool = False, anonymous: bool = False) -> str:
     head = "🏆 <b>النتيجة النهائية</b>" if final else "📊 <b>الترتيب الحالي</b>"
     lines = [f"{head} — اختبار #{quiz_id}", f"عدد الأسئلة: {total} • المشاركون: {len(rows)}", ""]
     if not rows:
         lines.append("لم يجب أحد بعد.")
     for i, (_uid, name, correct, answered) in enumerate(rows[:limit]):
         mark = MEDALS[i] if i < len(MEDALS) else f"{i + 1}."
+        if anonymous:
+            name = f"مشارك {i + 1}"
         pct = round(correct * 100 / total) if total else 0
         lines.append(f"{mark} {esc(name)} — <b>{correct}</b>/{total} ({pct}%)" + ("" if answered >= total else f" <i>أجاب على {answered}</i>"))
     if len(rows) > limit:
@@ -351,6 +382,8 @@ async def finish_session(bot: Bot, session_id: int) -> bool:
         qs.status, qs.finished_at = "closed", utcnow()   # close first: late answers are ignored
         await s.commit()
         chat_id, control_id, quiz_id, total = qs.chat_id, qs.control_message_id, qs.quiz_id, qs.total_questions
+        thread_id = qs.thread_id
+        board_cfg = json.loads(qs.settings_json or "{}")
         rows = await _leaderboard(s, session_id)
     for poll in polls:
         try:
@@ -359,7 +392,9 @@ async def finish_session(bot: Bot, session_id: int) -> bool:
             pass
         await asyncio.sleep(0.35)
     try:
-        await bot.send_message(chat_id, _format_board(rows, quiz_id, total, final=True))
+        await bot.send_message(chat_id, _format_board(rows, quiz_id, total,
+            limit=int(board_cfg.get("leaderboard_limit", 10)), anonymous=bool(board_cfg.get("anonymous_mode", False)), final=True),
+            message_thread_id=thread_id)
     except Exception:
         log.exception("could not send final leaderboard to %s", chat_id)
     if control_id:
