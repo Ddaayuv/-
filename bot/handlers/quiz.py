@@ -42,7 +42,7 @@ PRIVATE_DELAY = 0.4   # Telegram allows ~1 message/second to one user
 SHARED_DELAY = 3.2    # ~20 messages/minute in a group or channel
 MEDALS = ["🥇", "🥈", "🥉"]
 
-_publishing: set[int] = set()          # chat ids with a publish in progress
+_publishing: set[tuple[int, int]] = set()          # chat ids with a publish in progress
 _tasks: set[asyncio.Task] = set()      # keep references so tasks are not garbage collected
 
 
@@ -219,8 +219,9 @@ async def is_chat_admin(bot: Bot, chat_id: int, user_id: int) -> bool:
 async def _launch_publish(bot: Bot, quiz_id: int, chat_id: int, kind: str, title: str,
                           started_by: int, notify_chat_id: int, thread_id: int | None = None) -> str | None:
     """Starts publishing in the background. Returns an error text if it cannot start."""
-    if chat_id in _publishing:
-        return "⏳ هناك نشر جارٍ الآن في هذه الوجهة. انتظر حتى ينتهي."
+    lock_key = (chat_id, int(thread_id or 0))
+    if lock_key in _publishing:
+        return "⏳ هناك نشر جارٍ الآن في هذا الموضوع. انتظر حتى ينتهي."
     if kind != "channel":
         async with Session() as s:
             active = await s.scalar(select(QuizSession).where(
@@ -233,10 +234,11 @@ async def _launch_publish(bot: Bot, quiz_id: int, chat_id: int, kind: str, title
                     await s.commit()
                 else:
                     return f"يوجد اختبار نشط في هذه المجموعة (#{active.quiz_id}). أنهِه أولاً بالأمر /quizstop"
-    _publishing.add(chat_id)
+    _publishing.add(lock_key)
     task = asyncio.create_task(_publish_task(bot, quiz_id, chat_id, kind, title, started_by, notify_chat_id, thread_id))
     _tasks.add(task)
     task.add_done_callback(_tasks.discard)
+    task.add_done_callback(lambda _task: _publishing.discard(lock_key))
     return None
 
 
@@ -250,7 +252,7 @@ async def _publish_task(bot, quiz_id, chat_id, kind, title, started_by, notify_c
         except Exception:
             pass
     finally:
-        _publishing.discard(chat_id)
+        _publishing.discard((chat_id, int(thread_id or 0)))
 
 
 async def _publish_to_chat(bot: Bot, quiz_id: int, chat_id: int, kind: str, title: str,
@@ -388,6 +390,10 @@ async def finish_session(bot: Bot, session_id: int) -> bool:
         thread_id = qs.thread_id
         board_cfg = json.loads(qs.settings_json or "{}")
         rows = await _leaderboard(s, session_id)
+        quiz = await s.get(Quiz, quiz_id)
+        end_explanations = []
+        if board_cfg.get("explanation_mode") == "end" and quiz is not None:
+            end_explanations = [f"{q.number}. {esc(q.explanation)}" for q in quiz.questions if q.explanation]
     for poll in polls:
         try:
             await bot.stop_poll(chat_id, poll.message_id)
@@ -395,9 +401,11 @@ async def finish_session(bot: Bot, session_id: int) -> bool:
             pass
         await asyncio.sleep(0.35)
     try:
-        await bot.send_message(chat_id, _format_board(rows, quiz_id, total,
-            limit=int(board_cfg.get("leaderboard_limit", 10)), anonymous=bool(board_cfg.get("anonymous_mode", False)), final=True),
-            message_thread_id=thread_id)
+        final_text = _format_board(rows, quiz_id, total,
+            limit=int(board_cfg.get("leaderboard_limit", 10)), anonymous=bool(board_cfg.get("anonymous_mode", False)), final=True)
+        if end_explanations:
+            final_text += "\n\n💡 <b>الشروحات</b>\n" + "\n".join(end_explanations)[:2500]
+        await bot.send_message(chat_id, final_text, message_thread_id=thread_id)
     except Exception:
         log.exception("could not send final leaderboard to %s", chat_id)
     if control_id:
@@ -509,7 +517,7 @@ def _group_settings_text(cfg: GroupSettings) -> str:
             f"من يبدأ: {policy}\nوقت السؤال: {period}\nالمدة الكلية: {duration}\n"
             f"خلط الأسئلة: {'نعم' if cfg.shuffle_questions else 'لا'} • خلط الخيارات: {'نعم' if cfg.shuffle_options else 'لا'}\n"
             f"إظهار الشرح: {cfg.explanation_mode} • الترتيب المجهول: {'نعم' if cfg.anonymous_mode else 'لا'}\n"
-            f"عدد الظاهرين: {cfg.leaderboard_limit} • المحاولات: {cfg.max_attempts}")
+            f"عدد الظاهرين: {cfg.leaderboard_limit}")
 
 
 def _group_settings_kb(chat_id: int) -> InlineKeyboardMarkup:
