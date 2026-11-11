@@ -166,6 +166,10 @@ class QuizSession(Base):
     total_questions: Mapped[int] = mapped_column(Integer, default=0)
     status: Mapped[str] = mapped_column(String(20), default="publishing")
     control_message_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    thread_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    paused_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    ends_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    settings_json: Mapped[str] = mapped_column(Text, default="{}")
     started_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 
@@ -205,6 +209,43 @@ class QuizTarget(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
 
+class GroupSettings(Base):
+    """Persistent quiz policy and defaults for a Telegram group/supergroup."""
+    __tablename__ = "group_settings"
+    chat_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    title: Mapped[str] = mapped_column(String(200), default="")
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    start_policy: Mapped[str] = mapped_column(String(24), default="all_admins")
+    allowed_admin_ids_json: Mapped[str] = mapped_column(Text, default="[]")
+    open_period: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    duration_seconds: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    shuffle_questions: Mapped[bool] = mapped_column(Boolean, default=False)
+    shuffle_options: Mapped[bool] = mapped_column(Boolean, default=False)
+    max_attempts: Mapped[int] = mapped_column(Integer, default=1)
+    explanation_mode: Mapped[str] = mapped_column(String(16), default="after")
+    anonymous_mode: Mapped[bool] = mapped_column(Boolean, default=False)
+    leaderboard_limit: Mapped[int] = mapped_column(Integer, default=10)
+    timezone: Mapped[str] = mapped_column(String(64), default="Asia/Baghdad")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
+
+
+class GroupQuizSchedule(Base):
+    """A durable one-off or recurring quiz schedule for a group."""
+    __tablename__ = "group_quiz_schedules"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    chat_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    quiz_id: Mapped[int] = mapped_column(ForeignKey("quizzes.id", ondelete="CASCADE"), index=True)
+    thread_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    requested_by: Mapped[int] = mapped_column(BigInteger, default=0)
+    run_at: Mapped[datetime] = mapped_column(DateTime, index=True)
+    repeat_mode: Mapped[str] = mapped_column(String(12), default="none")
+    timezone: Mapped[str] = mapped_column(String(64), default="Asia/Baghdad")
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    last_run_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
 connect_args = {"timeout": 30} if settings.db_url.startswith("sqlite") else {}
 engine = create_async_engine(settings.db_url, connect_args=connect_args, pool_pre_ping=True)
 if settings.db_url.startswith("sqlite"):
@@ -222,6 +263,17 @@ def _sync_migrations(conn):
     # quiz explanations: create_all does not add columns to tables that already exist
     question_columns={c["name"] for c in inspector.get_columns("quiz_questions")} if inspector.has_table("quiz_questions") else set()
     if question_columns and "explanation" not in question_columns: conn.execute(text("ALTER TABLE quiz_questions ADD COLUMN explanation TEXT"))
+    session_columns = {c["name"] for c in inspector.get_columns("quiz_sessions")} if inspector.has_table("quiz_sessions") else set()
+    timestamp_type = "DATETIME" if conn.dialect.name == "sqlite" else "TIMESTAMP WITHOUT TIME ZONE"
+    session_additions = {
+        "thread_id": "BIGINT",
+        "paused_at": timestamp_type,
+        "ends_at": timestamp_type,
+        "settings_json": "TEXT NOT NULL DEFAULT '{}'",
+    }
+    for column, sql_type in session_additions.items():
+        if session_columns and column not in session_columns:
+            conn.execute(text(f"ALTER TABLE quiz_sessions ADD COLUMN {column} {sql_type}"))
     return add_practical,add_mode
 def snapshot_sqlite() -> str | None:
     """Copy the SQLite file next to itself before migrations so nothing can be lost silently."""
