@@ -123,8 +123,13 @@ class MembershipMiddleware(BaseMiddleware):
                 member.status == "restricted" and getattr(member, "is_member", False)
             )
         except TelegramAPIError:
-            log.warning("Membership check failed for user %s in channel %s", uid, chat, exc_info=True)
-            allowed = False
+            log.warning("Membership check unavailable for user %s in channel %s", uid, chat, exc_info=True)
+            temporary_error = "تعذّر التحقق من الاشتراك مؤقتاً بسبب اتصال Telegram. حاول مرة أخرى بعد قليل."
+            if isinstance(event, CallbackQuery):
+                await event.answer(temporary_error, show_alert=True)
+            elif isinstance(event, Message):
+                await event.answer(temporary_error)
+            return None
         if allowed:
             return await handler(event, data)
 
