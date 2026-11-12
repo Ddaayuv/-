@@ -8,6 +8,7 @@ from ..config import settings
 from ..db import User, Subject, Section, Item, BotSetting, Session, audit, set_setting, setting_enabled, create_item, slugify, db_counts, utcnow
 from ..utils import esc, is_url
 import asyncio
+import logging
 from .menu_manager import router as menu_manager_router
 from ..security import install_owner_guard
 from datetime import datetime, timedelta
@@ -15,6 +16,7 @@ router=Router()
 router.include_router(menu_manager_router)
 install_owner_guard(router, settings.owner_ids)
 PROCESS_STARTED_AT = datetime.utcnow()
+log = logging.getLogger(__name__)
 BROADCAST_TASKS: dict[int, asyncio.Task] = {}
 def owner(uid): return uid in settings.owner_ids
 def grid(buttons,w=2): return [buttons[i:i+w] for i in range(0,len(buttons),w)]
@@ -333,7 +335,7 @@ async def _run_broadcast(bot, owner_id: int, status_chat_id: int, status_message
                         chat_id=status_chat_id, message_id=status_message_id, reply_markup=status_kb,
                     )
                 except TelegramAPIError:
-                    pass
+                    log.warning("Could not update broadcast progress message %s", status_message_id, exc_info=True)
             await asyncio.sleep(0.04)
         await bot.edit_message_text(
             f"✅ انتهت الإذاعة\nالإجمالي: {total}\nنجحت: {success}\nفشلت: {failed}\n"
@@ -348,7 +350,7 @@ async def _run_broadcast(bot, owner_id: int, status_chat_id: int, status_message
                 chat_id=status_chat_id, message_id=status_message_id, reply_markup=back_panel(),
             )
         except TelegramAPIError:
-            pass
+            log.warning("Could not update cancelled broadcast status message %s", status_message_id, exc_info=True)
         raise
     finally:
         if BROADCAST_TASKS.get(owner_id) is current:
