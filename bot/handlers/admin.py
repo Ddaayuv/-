@@ -2,9 +2,10 @@ from aiogram import Router, F
 from aiogram.filters import Command
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-from sqlalchemy import select, func
+from aiogram.exceptions import TelegramAPIError, TelegramForbiddenError, TelegramRetryAfter
+from sqlalchemy import select, func, update
 from ..config import settings
-from ..db import User, Subject, Section, Item, BotSetting, audit, set_setting, setting_enabled, create_item, slugify, db_counts, utcnow
+from ..db import User, Subject, Section, Item, BotSetting, Session, audit, set_setting, setting_enabled, create_item, slugify, db_counts, utcnow
 from ..utils import esc, is_url
 import asyncio
 from .menu_manager import router as menu_manager_router
@@ -14,6 +15,7 @@ router=Router()
 router.include_router(menu_manager_router)
 install_owner_guard(router, settings.owner_ids)
 PROCESS_STARTED_AT = datetime.utcnow()
+BROADCAST_TASKS: dict[int, asyncio.Task] = {}
 def owner(uid): return uid in settings.owner_ids
 def grid(buttons,w=2): return [buttons[i:i+w] for i in range(0,len(buttons),w)]
 def panel_kb(): return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📊 الإحصائيات",callback_data="adm:stats"),InlineKeyboardButton(text="👥 المستخدمون",callback_data="adm:users")],[InlineKeyboardButton(text="➕ إضافة محتوى",callback_data="adm:add"),InlineKeyboardButton(text="📚 إدارة المواد",callback_data="adm:subjects")],[InlineKeyboardButton(text="📢 إذاعة",callback_data="adm:broadcast"),InlineKeyboardButton(text="⚙️ الإعدادات",callback_data="adm:settings")],[InlineKeyboardButton(text="🔒 الاشتراك الإجباري",callback_data="adm:forcesub"),InlineKeyboardButton(text="🔔 إشعارات الأعضاء",callback_data="adm:alerts")],[InlineKeyboardButton(text="📣 السماح بالإذاعة",callback_data="adm:announce"),InlineKeyboardButton(text="📖 عرض المواد",callback_data="adm:home")],[InlineKeyboardButton(text="🤖 إنشاء اختبار",callback_data="quiz:start"),InlineKeyboardButton(text="⚙️ إدارة الأزرار",callback_data="adm:buttons")]])
@@ -271,25 +273,120 @@ async def subjects_cmd(m,session):
 async def broadcast_start(cb,state):
     if not owner(cb.from_user.id):return await cb.answer("ممنوع",show_alert=True)
     await state.set_state(Broadcast.content); await cb.message.answer("📢 أرسل الرسالة/الملف الآن. ثم سأطلب تأكيداً.",reply_markup=cancel_kb()); await cb.answer()
+
 @router.message(Command("broadcast"))
 async def broadcast_cmd(m,state):
     if owner(m.from_user.id):await state.set_state(Broadcast.content); await m.answer("📢 أرسل المحتوى ثم أكد الإرسال.")
+
 @router.message(Broadcast.content)
 async def broadcast_preview(m,state,session):
     if not owner(m.from_user.id):return
     if not await setting_enabled(session,"announce",True):await state.clear();return await m.answer("⛔ الإذاعة متوقفة.")
-    await state.update_data(chat_id=m.chat.id,message_id=m.message_id); await state.set_state(Broadcast.confirm); await m.answer("👁 تمت المعاينة. هل تؤكد الإرسال؟",reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✅ إرسال",callback_data="adm:broadcast:confirm"),InlineKeyboardButton(text="❌ إلغاء",callback_data="adm:broadcast:cancel")]]))
+    await state.update_data(chat_id=m.chat.id,message_id=m.message_id); await state.set_state(Broadcast.confirm)
+    await m.answer("👁 تمت المعاينة. هل تؤكد الإرسال؟",reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✅ إرسال",callback_data="adm:broadcast:confirm"),InlineKeyboardButton(text="❌ إلغاء",callback_data="adm:broadcast:cancel")]]))
+
 @router.callback_query(F.data=="adm:broadcast:cancel")
-async def broadcast_cancel(cb,state): await state.clear(); await cb.message.edit_text("❌ تم إلغاء الإذاعة.",reply_markup=panel_kb()); await cb.answer()
+async def broadcast_cancel(cb,state):
+    if not owner(cb.from_user.id):return await cb.answer("ممنوع",show_alert=True)
+    await state.clear(); await cb.message.edit_text("❌ تم إلغاء الإذاعة.",reply_markup=panel_kb()); await cb.answer()
+
+async def _mark_user_inactive(user_id: int) -> None:
+    async with Session() as db_session:
+        await db_session.execute(update(User).where(User.telegram_id == user_id).values(is_active=False))
+        await db_session.commit()
+
+async def _run_broadcast(bot, owner_id: int, status_chat_id: int, status_message_id: int,
+                         source_chat_id: int, source_message_id: int, user_ids: list[int]) -> None:
+    success = failed = blocked = 0
+    total = len(user_ids)
+    status_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⏹ إيقاف الإذاعة", callback_data="adm:broadcast:stop")]
+    ])
+    current = asyncio.current_task()
+    try:
+        for index, user_id in enumerate(user_ids, start=1):
+            try:
+                await bot.copy_message(user_id, source_chat_id, source_message_id)
+                success += 1
+            except TelegramRetryAfter as exc:
+                await asyncio.sleep(max(1, float(exc.retry_after)) + 0.5)
+                try:
+                    await bot.copy_message(user_id, source_chat_id, source_message_id)
+                    success += 1
+                except TelegramForbiddenError:
+                    blocked += 1
+                    failed += 1
+                    await _mark_user_inactive(user_id)
+                except TelegramAPIError:
+                    failed += 1
+            except TelegramForbiddenError:
+                blocked += 1
+                failed += 1
+                await _mark_user_inactive(user_id)
+            except TelegramAPIError:
+                failed += 1
+            if index % 25 == 0 or index == total:
+                try:
+                    await bot.edit_message_text(
+                        f"📢 الإذاعة قيد التنفيذ\nتمت معالجة: {index}/{total}\n"
+                        f"نجحت: {success} | فشلت: {failed} | حُظر البوت: {blocked}",
+                        chat_id=status_chat_id, message_id=status_message_id, reply_markup=status_kb,
+                    )
+                except TelegramAPIError:
+                    pass
+            await asyncio.sleep(0.04)
+        await bot.edit_message_text(
+            f"✅ انتهت الإذاعة\nالإجمالي: {total}\nنجحت: {success}\nفشلت: {failed}\n"
+            f"حسابات حظرت البوت: {blocked}",
+            chat_id=status_chat_id, message_id=status_message_id, reply_markup=back_panel(),
+        )
+    except asyncio.CancelledError:
+        try:
+            await bot.edit_message_text(
+                f"⏹ أُوقفت الإذاعة\nتمت معالجة: {success + failed}/{total}\n"
+                f"نجحت: {success} | فشلت: {failed} | حظر البوت: {blocked}",
+                chat_id=status_chat_id, message_id=status_message_id, reply_markup=back_panel(),
+            )
+        except TelegramAPIError:
+            pass
+        raise
+    finally:
+        if BROADCAST_TASKS.get(owner_id) is current:
+            BROADCAST_TASKS.pop(owner_id, None)
+
+@router.callback_query(F.data=="adm:broadcast:stop")
+async def broadcast_stop(cb):
+    if not owner(cb.from_user.id):return await cb.answer("ممنوع",show_alert=True)
+    task = BROADCAST_TASKS.get(cb.from_user.id)
+    if task and not task.done():
+        task.cancel()
+        await cb.answer("جارٍ إيقاف الإذاعة…")
+    else:
+        await cb.answer("لا توجد إذاعة نشطة.", show_alert=True)
+
 @router.callback_query(F.data=="adm:broadcast:confirm")
 async def broadcast_confirm(cb,state,session):
     if not owner(cb.from_user.id):return await cb.answer("ممنوع",show_alert=True)
-    d=await state.get_data(); users=(await session.scalars(select(User.telegram_id))).all(); ok=bad=0; await cb.message.edit_text(f"📢 جارٍ الإرسال إلى {len(users)} مستخدم...")
-    for uid in users:
-        try:await cb.bot.copy_message(uid,d["chat_id"],d["message_id"]); ok+=1
-        except:bad+=1
-        await asyncio.sleep(.04)
-    await state.clear(); await cb.message.edit_text(f"✅ انتهت الإذاعة\nنجحت: {ok}\nفشلت: {bad}",reply_markup=back_panel()); await cb.answer()
+    existing = BROADCAST_TASKS.get(cb.from_user.id)
+    if existing and not existing.done():
+        return await cb.answer("توجد إذاعة قيد التنفيذ بالفعل.", show_alert=True)
+    d=await state.get_data()
+    user_ids=(await session.scalars(select(User.telegram_id).where(User.is_active.is_(True)))).all()
+    await state.clear()
+    status = await cb.message.edit_text(
+        f"📢 بدأت الإذاعة إلى {len(user_ids)} مستخدم…",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⏹ إيقاف الإذاعة", callback_data="adm:broadcast:stop")]
+        ]),
+    )
+    task = asyncio.create_task(
+        _run_broadcast(cb.bot, cb.from_user.id, status.chat.id, status.message_id,
+                       d["chat_id"], d["message_id"], list(user_ids)),
+        name=f"broadcast-{cb.from_user.id}",
+    )
+    BROADCAST_TASKS[cb.from_user.id] = task
+    await cb.answer("بدأت الإذاعة بالخلفية.")
+
 @router.callback_query(F.data=="adm:home")
 async def admin_home(cb,session):
     if owner(cb.from_user.id):

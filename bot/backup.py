@@ -49,7 +49,7 @@ async def build_backup_data() -> dict:
     return {
         "version": 2,
         "created_at": datetime.utcnow().isoformat(),
-        "users": [{"telegram_id": u.telegram_id, "name": u.name, "username": u.username} for u in users],
+        "users": [{"telegram_id": u.telegram_id, "name": u.name, "username": u.username, "is_active": u.is_active} for u in users],
         "subjects": [{"id": x.id, "slug": x.slug, "name_ar": x.name_ar, "name_en": x.name_en, "emoji": x.emoji,
                       "aliases": x.aliases, "sort_order": x.sort_order, "is_active": x.is_active,
                       "has_practical": x.has_practical} for x in subjects],
@@ -302,7 +302,7 @@ async def restore_backup(data: dict) -> dict:
             s.add(item); added["items"] += 1; added["attachments"] += len(item.attachments)
         for u in data.get("users", []):
             if not await s.scalar(select(User.id).where(User.telegram_id == u["telegram_id"])):
-                s.add(User(telegram_id=u["telegram_id"], name=u.get("name", ""), username=u.get("username")))
+                s.add(User(telegram_id=u["telegram_id"], name=u.get("name", ""), username=u.get("username"), is_active=u.get("is_active", True)))
                 added["users"] += 1
         await _restore_group_quiz_data(s, data, added)
         await s.commit()

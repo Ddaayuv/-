@@ -1,5 +1,9 @@
 import asyncio
 import logging
+import time
+
+from aiogram.types import ErrorEvent
+from aiogram.exceptions import TelegramAPIError
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
@@ -15,6 +19,10 @@ from .middlewares import DbMiddleware, MembershipMiddleware, ThrottleMiddleware
 from .handlers.quiz import quiz_maintenance_loop, recover_group_quiz_sessions
 
 
+ERROR_NOTIFY_INTERVAL = 60.0
+_last_error_notification = 0.0
+
+
 async def main() -> None:
     logging.basicConfig(level=getattr(logging, settings.log_level), format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     await init_db()
@@ -23,6 +31,43 @@ async def main() -> None:
         me = await bot.get_me()
         runtime["bot_username"] = me.username or ""
         dp = Dispatcher(storage=MemoryStorage())
+
+        async def handle_update_error(event: ErrorEvent) -> bool:
+            global _last_error_notification
+            error = event.exception
+            logging.getLogger("bot.errors").exception(
+                "Unhandled update error; update_id=%s", event.update.update_id,
+                exc_info=(type(error), error, error.__traceback__),
+            )
+            update = event.update
+            message = update.message or update.edited_message
+            callback = update.callback_query
+            if message and message.chat.type == "private":
+                try:
+                    await message.answer("⚠️ حدث خطأ غير متوقع أثناء تنفيذ طلبك. حاول مرة أخرى لاحقاً.")
+                except TelegramAPIError:
+                    logging.getLogger("bot.errors").warning("Could not send error notice to user")
+            elif callback:
+                try:
+                    await callback.answer("حدث خطأ غير متوقع. حاول مرة أخرى.", show_alert=True)
+                except TelegramAPIError:
+                    logging.getLogger("bot.errors").warning("Could not answer failed callback")
+            now = time.monotonic()
+            if now - _last_error_notification >= ERROR_NOTIFY_INTERVAL:
+                _last_error_notification = now
+                for owner_id in settings.owner_ids:
+                    try:
+                        await bot.send_message(
+                            owner_id,
+                            f"⚠️ خطأ غير معالج في البوت\nUpdate: <code>{update.update_id}</code>\n"
+                            f"النوع: <code>{type(error).__name__}</code>\n"
+                            f"التفاصيل: <code>{str(error)[:700]}</code>",
+                        )
+                    except TelegramAPIError:
+                        logging.getLogger("bot.errors").warning("Could not notify owner %s", owner_id)
+            return True
+
+        dp.errors.register(handle_update_error)
 
         # Middlewares must be attached to message/callback observers, not dp.update.
         # Message/CallbackQuery provide from_user and are handled by our middleware.
@@ -79,7 +124,7 @@ async def main() -> None:
                 try:
                     await bot.send_message(owner_id, "⚠️ قاعدة البيانات فارغة عند التشغيل. إذا كان عندك محتوى سابق فالتخزين غير دائم: فعّل Volume على Railway (DB_PATH=/app/data/bot.db) أو استخدم PostgreSQL عبر DATABASE_URL، ثم استرجع آخر نسخة بالأمر /restore.")
                 except Exception:
-                    pass
+                    logging.exception("Could not warn owner %s about empty database", owner_id)
         if settings.backup_chat_id is None:
             for owner_id in settings.owner_ids:
                 try:
