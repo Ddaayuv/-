@@ -304,3 +304,24 @@
 - الاختبار الوحدوي لا يختبر خادم Redis حقيقياً؛ فقط مسار قاعدة البيانات على SQLite in-memory. يحتاج Redis الحقيقي إلى ضبط REDIS_URL في بيئة اختبار.
 
 - تم التخلص من استثناءين صامتين في الإذاعة: فشل تحديث رسالة التقدم وفشل رسالة حالة الإلغاء يسجلان الآن تحذيراً مع stack trace ورقم الرسالة.
+
+
+## سجل الصيانة — المرحلة 5: إصلاح حماية المالك والتنظيف — 12 نوفمبر 2026
+
+### خلل خطير تم إصلاحه
+- `install_owner_guard` كان يركّب `OwnerOnlyMiddleware` كـ **outer middleware** على `admin.router`. بما أن `admin.router` مسجّل قبل `user.router`، كانت أي رسالة أو callback من غير المالك (حتى `/start`) تتوقف في الراوتر الإداري برسالة «⛔ هذه العملية للمالك فقط» ولا تصل إلى `user.router`. الاختبارات السابقة كانت تفحص الـ middleware منفرداً فلم تكتشف ذلك.
+- الإصلاح: تحويله إلى **inner middleware** (`router.message.middleware` و`router.callback_query.middleware`) فيعمل فقط بعد تطابق معالج إداري فعلاً. ما زالت كل معالجات الإدارة (ومنها `menu_manager` المضمَّن) محمية، ويبقى المرور العام للزر `mb:*`.
+
+### تنظيف
+- حذف نسختين ميتتين مكررتين من `group_quiz_stop` و`group_quiz_results` في `quiz.py` (الأحدث تدعم المواضيع وإعدادات الترتيب والإخفاء).
+- استبدال 3 `except:` عارية في `admin.py` بـ `except (ValueError, TypeError)`.
+- استبدال 5 `except Exception: pass` في `quiz.py` بـ `except TelegramAPIError` مع سجل debug.
+
+### الاختبارات
+- `tests/test_dispatch_integration.py`: يمر عبر `Dispatcher` حقيقي وبالراوترات الحقيقية (`admin` و`quiz`) بنفس ترتيب `main.py`: المستخدم العادي يصل إلى user.router، وغير المالك يُرفض في الأوامر والـ callbacks الإدارية، والمالك لا يُمنع.
+- `tests/test_owner_guard_dispatch.py`: نفس الفكرة بمعالجات صناعية.
+- تم التحقق بأن 3 من هذه الاختبارات **تفشل** مع الحماية القديمة (outer) و**تنجح** مع الإصلاح. إجمالي الاختبارات: 33 ناجحاً، ruff وcompileall ناجحان.
+- `tests/conftest.py`: متغيرات بيئة اختبارية فقط (لا اتصال بتيليجرام أو قاعدة حقيقية).
+
+### لم يُختبر
+- التشغيل الفعلي مع تيليجرام وقاعدة PostgreSQL الإنتاجية.

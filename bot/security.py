@@ -42,6 +42,11 @@ class OwnerOnlyMiddleware(BaseMiddleware):
 
 
 def install_owner_guard(router: Any, owner_ids: Iterable[int]) -> None:
-    """Install the owner guard on both message and callback observers."""
-    router.message.outer_middleware(OwnerOnlyMiddleware(owner_ids))
-    router.callback_query.outer_middleware(OwnerOnlyMiddleware(owner_ids))
+    """Install the owner guard on both message and callback observers.
+
+    Must be an INNER middleware: it then runs only after one of this router's handlers
+    matched. An outer middleware runs for every update reaching the router, and since the
+    admin router is registered before the user router it would swallow every non-owner update.
+    """
+    router.message.middleware(OwnerOnlyMiddleware(owner_ids))
+    router.callback_query.middleware(OwnerOnlyMiddleware(owner_ids))

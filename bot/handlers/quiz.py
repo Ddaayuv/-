@@ -410,8 +410,8 @@ async def finish_session(bot: Bot, session_id: int) -> bool:
     for poll in polls:
         try:
             await bot.stop_poll(chat_id, poll.message_id)
-        except Exception:
-            pass
+        except TelegramAPIError as exc:
+            log.debug("stop_poll failed chat=%s message=%s: %s", chat_id, poll.message_id, exc)
         await asyncio.sleep(0.35)
     try:
         final_text = _format_board(rows, quiz_id, total,
@@ -424,8 +424,8 @@ async def finish_session(bot: Bot, session_id: int) -> bool:
     if control_id:
         try:
             await bot.edit_message_reply_markup(chat_id=chat_id, message_id=control_id, reply_markup=None)
-        except Exception:
-            pass
+        except TelegramAPIError as exc:
+            log.debug("could not clear control buttons chat=%s: %s", chat_id, exc)
     return True
 
 
@@ -1001,26 +1001,6 @@ async def group_migrated(message: Message):
         log.warning("Could not announce chat migration old=%s new=%s", old_chat_id, new_chat_id)
 
 
-@router.message(Command("quizstop"), F.chat.type.in_(GROUP_TYPES))
-async def group_quiz_stop(message: Message, session):
-    uid = message.from_user.id if message.from_user else 0
-    if not (_anonymous_admin(message) or await is_chat_admin(message.bot, message.chat.id, uid)):
-        return await message.reply("⛔ هذا الأمر لمشرفي المجموعة فقط.")
-    qs = await _latest_session(session, message.chat.id, only_active=True, thread_id=topic_thread_id(message))
-    if qs is None:
-        return await message.reply("لا يوجد اختبار نشط في هذه المجموعة.")
-    await finish_session(message.bot, qs.id)
-
-
-@router.message(Command("quizresults"), F.chat.type.in_(GROUP_TYPES))
-async def group_quiz_results(message: Message, session):
-    qs = await _latest_session(session, message.chat.id)
-    if qs is None:
-        return await message.reply("لم يُنشر أي اختبار في هذه المجموعة بعد.")
-    rows = await _leaderboard(session, qs.id)
-    await message.reply(_format_board(rows, qs.quiz_id, qs.total_questions, final=qs.status == "closed"))
-
-
 # ----------------------------------------------------------------------------- bot added to / removed from a chat
 
 @router.my_chat_member()
@@ -1066,8 +1046,8 @@ async def bot_membership_changed(event: ChatMemberUpdated):
     if adder:
         try:
             await event.bot.send_message(adder, f"✅ ربطتُ «{esc(chat.title or '')}» بالبوت لنشر الاختبارات. {hint}.{note}")
-        except Exception:
-            pass
+        except TelegramAPIError as exc:
+            log.debug("could not notify adder %s: %s", adder, exc)
 
 
 # ----------------------------------------------------------------------------- private flow: create / preview / save
@@ -1158,8 +1138,8 @@ async def quiz_confirm(cb: CallbackQuery, state: FSMContext, session):
         return
     try:
         await cb.message.edit_text(f"✅ تم حفظ الاختبار #{quiz.id}. جارٍ إرسال الأسئلة...")
-    except Exception:
-        pass
+    except TelegramAPIError as exc:
+        log.debug("edit_text failed: %s", exc)
     await cb.answer("تم حفظ الاختبار")
     await _publish_attempt(cb.bot, session, quiz, cb.from_user.id)
 
@@ -1223,8 +1203,8 @@ async def _show_picker(message: Message, bot: Bot, session, user_id: int, quiz_i
     if edit:
         try:
             return await message.edit_text(text, reply_markup=kb)
-        except Exception:
-            pass
+        except TelegramAPIError as exc:
+            log.debug("edit_text failed, sending a new message: %s", exc)
     await message.answer(text, reply_markup=kb)
 
 
