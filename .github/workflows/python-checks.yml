@@ -18,8 +18,10 @@ jobs:
       - run: python -m ruff check bot tests
       - run: python -m compileall -q bot tests
       - run: python -m pytest -q
+      - name: Build Docker image
+        run: docker build -t steyat-bot:ci .
       - name: Package source ZIP
-        run: zip -r group-quiz-controls.zip . -x ".git/*" ".env" "group-quiz-controls.zip" "*/__pycache__/*" ".pytest_cache/*"
+        run: zip -r group-quiz-controls.zip . -x ".git/*" ".env" "group-quiz-controls.zip" "*/__pycache__/*" ".pytest_cache/*" ".ruff_cache/*"
       - uses: actions/upload-artifact@v4
         with:
           name: group-quiz-controls
