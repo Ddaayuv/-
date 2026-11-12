@@ -319,10 +319,29 @@ async def init_db():
             if await s.get(BotSetting,k) is None: s.add(BotSetting(key=k,value=v))
 
         await s.commit()
-async def touch_user(session,tg_user):
-    u=await session.scalar(select(User).where(User.telegram_id==tg_user.id)); now=utcnow()
-    if u is None: session.add(User(telegram_id=tg_user.id,name=tg_user.full_name,username=tg_user.username,joined_at=now,last_active=now)); await session.flush(); return True
-    u.name,u.username,u.last_active=tg_user.full_name,tg_user.username,now; return False
+async def touch_user(session, tg_user, minimum_interval_seconds=300):
+    from .middleware_logic import should_refresh_last_active
+
+    user = await session.scalar(select(User).where(User.telegram_id == tg_user.id))
+    now = utcnow()
+    if user is None:
+        session.add(User(
+            telegram_id=tg_user.id,
+            name=tg_user.full_name,
+            username=tg_user.username,
+            joined_at=now,
+            last_active=now,
+        ))
+        await session.flush()
+        return True
+
+    if user.name != tg_user.full_name:
+        user.name = tg_user.full_name
+    if user.username != tg_user.username:
+        user.username = tg_user.username
+    if should_refresh_last_active(user.last_active, now, minimum_interval_seconds):
+        user.last_active = now
+    return False
 async def get_setting(session,name,default=""):
     row=await session.get(BotSetting,name); return row.value if row is not None else default
 async def set_setting(session,name,value):
