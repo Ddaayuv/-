@@ -223,3 +223,9 @@ python -m compileall -q bot tests
 - تنبيه: `tg_file_id` مرتبط بالبوت/التوكن الذي أنشأه؛ قد لا يعمل بعد تبديل التوكن، لذا احتفظ أيضاً بروابط الملفات أو نسخها الأصلية إن توفرت.
 - للتشغيل مع PostgreSQL عبر Compose، انسخ `.env.example` إلى `.env` وعيّن `POSTGRES_PASSWORD` و`DATABASE_URL` بعنوان المضيف `postgres`، ثم نفّذ `docker compose --profile postgres up --build`.
 - ملف قفل كامل لكل الاعتماديات الانتقالية عبر pip-tools/uv لم يضاف في هذا التحديث بعد؛ المتطلبات الحالية ما زالت تستخدم نطاقات نسخ.
+
+## قفل الاعتماديات
+
+- ملفا `requirements.in` و`requirements-dev.in` هما مدخلا pip-tools.
+- `requirements.lock` يقفل اعتماديات التشغيل، و`requirements-dev.lock` يقفل اعتماديات الاختبار وRuff أيضاً. Docker يثبت من `requirements.lock` فقط.
+- بعد تعديل المتطلبات، حدّث الملفين باستخدام `pip-compile --resolver=backtracking --output-file=requirements.lock requirements.in` و`pip-compile --resolver=backtracking --output-file=requirements-dev.lock requirements-dev.in` ثم شغّل CI.

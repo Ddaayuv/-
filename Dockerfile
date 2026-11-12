@@ -7,9 +7,9 @@ ENV PYTHONUNBUFFERED=1 \\
 WORKDIR /app
 
 # Install dependencies before source to keep the dependency layer cacheable.
-COPY requirements.txt ./
+COPY requirements.lock ./
 RUN python -m pip install --upgrade pip \\
-    && pip install -r requirements.txt
+    && pip install -r requirements.lock
 
 COPY bot ./bot
 COPY railway.json ./railway.json
