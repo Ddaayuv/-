@@ -36,7 +36,7 @@ class DbMiddleware(BaseMiddleware):
             if is_new:
                 await session.commit()
                 if user.id not in settings.owner_ids and await setting_enabled(session, "new_user_alerts", True):
-                    text = f"🆕 عضو جديد\\n👤 {user.full_name}\\n🆔 <code>{user.id}</code>"
+                    text = f"🆕 عضو جديد\n👤 {user.full_name}\n🆔 <code>{user.id}</code>"
                     for owner_id in settings.owner_ids:
                         try:
                             await data["bot"].send_message(owner_id, text)
@@ -133,7 +133,7 @@ class MembershipMiddleware(BaseMiddleware):
             [InlineKeyboardButton(text="📢 الاشتراك بالقناة", url=link or "https://t.me/")],
             [InlineKeyboardButton(text="✅ تحقق من الاشتراك", callback_data="check_sub")],
         ])
-        prompt = "🔒 <b>الاشتراك مطلوب</b>\\n\\nاشترك بالقناة أولاً ثم اضغط «تحقق من الاشتراك».">
+        prompt = "🔒 <b>الاشتراك مطلوب</b>\n\nاشترك بالقناة أولاً ثم اضغط «تحقق من الاشتراك»."
         if isinstance(event, CallbackQuery):
             await event.answer("يجب الاشتراك أولاً", show_alert=True)
             try:
