@@ -88,6 +88,14 @@ class BotSetting(Base):
     value: Mapped[str] = mapped_column(Text, default="")
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
 
+class FSMStorageRecord(Base):
+    __tablename__ = "fsm_storage"
+    key: Mapped[str] = mapped_column(String(1024), primary_key=True)
+    state: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    data_json: Mapped[str] = mapped_column(Text, default="{}")
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
+
+
 class MenuButton(Base):
     __tablename__ = "menu_buttons"
     id: Mapped[int] = mapped_column(primary_key=True)

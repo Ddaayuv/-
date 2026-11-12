@@ -82,6 +82,7 @@ class Settings:
     timezone: str
     log_level: str
     bot_version: str
+    redis_url: str | None = None
     new_days: int = 7
 
 
@@ -113,6 +114,9 @@ def _load() -> Settings:
 
     log_level = _choice(os.getenv("LOG_LEVEL", "INFO"), {"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"}, "LOG_LEVEL")
     bot_version = os.getenv("BOT_VERSION", "development").strip() or "development"
+    redis_url = os.getenv("REDIS_URL", "").strip() or None
+    if redis_url and not redis_url.startswith(("redis://", "rediss://", "unix://")):
+        raise SystemExit("REDIS_URL يجب أن يبدأ بـ redis:// أو rediss:// أو unix://")
     return Settings(
         bot_token=token, owner_ids=owners,
         academy_name=os.getenv("ACADEMY_NAME", "أكاديمية الأمن السيبراني"),
@@ -126,6 +130,7 @@ def _load() -> Settings:
         timezone=timezone_name,
         log_level=log_level,
         bot_version=bot_version,
+        redis_url=redis_url,
     )
 
 
