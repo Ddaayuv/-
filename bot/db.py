@@ -265,26 +265,6 @@ Session = async_sessionmaker(engine, expire_on_commit=False)
 SECTIONS = [("lectures","المحاضرات","🎥","محاضرات,محاضره,فيديو,lectures,lecture,video"),("notes","الملاحظات","📝","ملاحظات,ملخصات,ملخص,notes,summary"),("practical","العملي","🧪","عملي,lab,labs,practical"),("files","الملفات","📄","ملفات,files,file,pdf"),("questions","الأسئلة","❓","اسئله,اسئلة,مراجعه,questions,quiz"),("key_points","أهم النقاط","⭐","مهم,اهم النقاط,important"),("resources","المصادر","📚","مصادر,مراجع,resources")]
 SUBJECTS = [("linux","أساسيات Linux","Linux Basics","🐧","لينكس,لينوكس,linux",True),("cyber-basics","أساسيات الأمن السيبراني","Cybersecurity Basics","🛡","الامن السيبراني,امن سيبراني,cybersecurity,security",True),("crypto","أساسيات التشفير","Cryptography Basics","🔐","التشفير,اساسيات التشفير,cryptography,crypto",False),("web-dev","برمجة المواقع","Web Development","🌐","ويب,web,برمجه مواقع",True),("statistics","الإحصاء","Statistics","📊","الاحصاء,احتمالية,احتمالات,الاحصاء الاحتمالي,statistics,stats",False),("pentest","اختبار الاختراق","Penetration Testing","🎯","pentest,penetration testing,اختراق",True),("arabic","اللغة العربية","Arabic","📖","عربي,العربيه,arabic",False),("networks","أساسيات الشبكات","Networking Basics","📡","الشبكات,شبكات,networking,network",True),("english","اللغة الإنكليزية","English","🔤","الانجليزيه,انجليزي,انكليزي,english",False),("ethics","الأخلاقيات","Ethics","⚖️","اخلاقيات,اخلاقيات مهنية,المهنة,ethics",False),("python","Python","Python","🐍","بايثون,بايثن,البايثون للامن السيبراني,python",True),("human-rights","حقوق الإنسان","Human Rights","🕊","حقوق الانسان,human rights",False)]
 DEFAULT_SETTINGS={"channel_id":str(settings.channel_id or ""),"channel_link":settings.channel_link,"force_sub":str(settings.require_membership).lower(),"new_user_alerts":"true","announce":str(settings.announce).lower()}
-def _sync_migrations(conn):
-    inspector=inspect(conn); user_columns={c["name"] for c in inspector.get_columns("users")} if inspector.has_table("users") else set(); subject_columns={c["name"] for c in inspector.get_columns("subjects")} if inspector.has_table("subjects") else set(); item_columns={c["name"] for c in inspector.get_columns("items")} if inspector.has_table("items") else set(); add_practical="has_practical" not in subject_columns; add_mode="study_mode" not in item_columns
-    if user_columns and "is_active" not in user_columns: conn.execute(text(f"ALTER TABLE users ADD COLUMN is_active BOOLEAN NOT NULL DEFAULT {'1' if conn.dialect.name=='sqlite' else 'TRUE'}"))
-    if add_practical: conn.execute(text(f"ALTER TABLE subjects ADD COLUMN has_practical BOOLEAN NOT NULL DEFAULT {'0' if conn.dialect.name=='sqlite' else 'FALSE'}"))
-    if add_mode: conn.execute(text("ALTER TABLE items ADD COLUMN study_mode VARCHAR(20) NOT NULL DEFAULT 'general'"))
-    # quiz explanations: create_all does not add columns to tables that already exist
-    question_columns={c["name"] for c in inspector.get_columns("quiz_questions")} if inspector.has_table("quiz_questions") else set()
-    if question_columns and "explanation" not in question_columns: conn.execute(text("ALTER TABLE quiz_questions ADD COLUMN explanation TEXT"))
-    session_columns = {c["name"] for c in inspector.get_columns("quiz_sessions")} if inspector.has_table("quiz_sessions") else set()
-    timestamp_type = "DATETIME" if conn.dialect.name == "sqlite" else "TIMESTAMP WITHOUT TIME ZONE"
-    session_additions = {
-        "thread_id": "BIGINT",
-        "paused_at": timestamp_type,
-        "ends_at": timestamp_type,
-        "settings_json": "TEXT NOT NULL DEFAULT '{}'",
-    }
-    for column, sql_type in session_additions.items():
-        if session_columns and column not in session_columns:
-            conn.execute(text(f"ALTER TABLE quiz_sessions ADD COLUMN {column} {sql_type}"))
-    return add_practical,add_mode
 def snapshot_sqlite() -> str | None:
     """Copy the SQLite file next to itself before migrations so nothing can be lost silently."""
     if not settings.db_url.startswith("sqlite"): return None
@@ -309,8 +289,30 @@ async def db_counts(session) -> dict:
         ) or 0,
     }
 async def init_db():
+    """Run additive Alembic migrations, then seed/repair application data."""
+    import asyncio
+    from pathlib import Path
+    from alembic import command
+    from alembic.config import Config
+
     snapshot_sqlite()
-    async with engine.begin() as conn: await conn.run_sync(Base.metadata.create_all); added_practical,added_mode=await conn.run_sync(_sync_migrations)
+
+    async with engine.connect() as connection:
+        def _was_practical_column_missing(sync_connection):
+            inspector = inspect(sync_connection)
+            if not inspector.has_table("subjects"):
+                return False
+            return "has_practical" not in {
+                column["name"] for column in inspector.get_columns("subjects")
+            }
+
+        added_practical = await connection.run_sync(_was_practical_column_missing)
+
+    project_root = Path(__file__).resolve().parent.parent
+    alembic_config = Config(str(project_root / "alembic.ini"))
+    alembic_config.set_main_option("script_location", str(project_root / "migrations"))
+    await asyncio.to_thread(command.upgrade, alembic_config, "head")
+
     async with Session() as s:
         if not await s.scalar(select(Section.id).limit(1)):
             for i,(slug,ar,em,al) in enumerate(SECTIONS): s.add(Section(slug=slug,name_ar=ar,emoji=em,aliases=al,sort_order=i))
