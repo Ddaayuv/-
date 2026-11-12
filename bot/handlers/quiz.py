@@ -33,6 +33,7 @@ from ..membership import inspect_channel, status_of
 from ..quiz_parser import MAX_EXPLANATION, parse_quiz_text
 from ..utils import esc, parse_chat_ref
 from ..group_quiz_logic import can_start_quiz, rank_leaderboard, local_schedule_to_utc, next_schedule_time
+from ..topic_utils import topic_thread_id, notification_topic_kwargs
 
 router = Router()
 log = logging.getLogger(__name__)
@@ -243,14 +244,19 @@ async def _launch_publish(bot: Bot, quiz_id: int, chat_id: int, kind: str, title
 
 
 async def _publish_task(bot, quiz_id, chat_id, kind, title, started_by, notify_chat_id, thread_id=None) -> None:
+    notify_kwargs = notification_topic_kwargs(chat_id, notify_chat_id, thread_id)
     try:
         await _publish_to_chat(bot, quiz_id, chat_id, kind, title, started_by, notify_chat_id, thread_id)
     except Exception:
         log.exception("quiz publish crashed (chat=%s)", chat_id)
         try:
-            await bot.send_message(notify_chat_id, "❌ حدث خطأ غير متوقع أثناء نشر الاختبار. راجع سجلات الخادم.")
-        except Exception:
-            pass
+            await bot.send_message(
+                notify_chat_id,
+                "❌ حدث خطأ غير متوقع أثناء نشر الاختبار. راجع سجلات الخادم.",
+                **notify_kwargs,
+            )
+        except TelegramAPIError:
+            log.warning("Could not send publish-crash notification to chat=%s", notify_chat_id, exc_info=True)
     finally:
         _publishing.discard((chat_id, int(thread_id or 0)))
 
@@ -261,7 +267,11 @@ async def _publish_to_chat(bot: Bot, quiz_id: int, chat_id: int, kind: str, titl
     async with Session() as session:
         quiz = await session.get(Quiz, quiz_id)
         if quiz is None or not quiz.questions:
-            await bot.send_message(notify_chat_id, "❌ الاختبار غير موجود أو بلا أسئلة.")
+            await bot.send_message(
+                notify_chat_id,
+                "❌ الاختبار غير موجود أو بلا أسئلة.",
+                **notification_topic_kwargs(chat_id, notify_chat_id, thread_id),
+            )
             return
         questions = list(quiz.questions)
         group_settings = await session.get(GroupSettings, chat_id) if not is_channel else None
@@ -332,9 +342,13 @@ async def _publish_to_chat(bot: Bot, quiz_id: int, chat_id: int, kind: str, titl
     else:
         text = f"❌ لم يُنشر الاختبار في «{esc(title)}»: {esc(failure)}"
     try:
-        await bot.send_message(notify_chat_id, text)
-    except Exception:
-        pass
+        await bot.send_message(
+            notify_chat_id,
+            text,
+            **notification_topic_kwargs(chat_id, notify_chat_id, thread_id),
+        )
+    except TelegramAPIError:
+        log.warning("Could not send publish result notification to chat=%s", notify_chat_id, exc_info=True)
 
 
 # ----------------------------------------------------------------------------- leaderboard / finishing
@@ -620,7 +634,7 @@ async def group_quiz(message: Message, command: CommandObject, session):
             return await message.reply(_problems_text(parsed)[:3900])
         quiz = await _save_quiz(session, uid, source, parsed)
     chat = message.chat
-    thread_id = getattr(message, "message_thread_id", None)
+    thread_id = topic_thread_id(message)
     error = await _launch_publish(bot, quiz.id, chat.id, "group", chat.title or "", uid, chat.id, thread_id)
     if error:
         return await message.reply(error)
@@ -634,7 +648,7 @@ async def group_quiz_pause(message: Message, session):
     uid = message.from_user.id if message.from_user else 0
     if not (_anonymous_admin(message) or await is_chat_admin(message.bot, message.chat.id, uid)):
         return await message.reply("⛔ هذا الأمر للمشرفين فقط.")
-    qs = await _latest_session(session, message.chat.id, only_active=True, thread_id=getattr(message, "message_thread_id", None))
+    qs = await _latest_session(session, message.chat.id, only_active=True, thread_id=topic_thread_id(message))
     if qs is None or qs.status != "active":
         return await message.reply("لا يوجد اختبار نشط قابل للإيقاف.")
     qs.status, qs.paused_at = "paused", utcnow()
@@ -647,7 +661,7 @@ async def group_quiz_resume(message: Message, session):
     uid = message.from_user.id if message.from_user else 0
     if not (_anonymous_admin(message) or await is_chat_admin(message.bot, message.chat.id, uid)):
         return await message.reply("⛔ هذا الأمر للمشرفين فقط.")
-    qs = await _latest_session(session, message.chat.id, thread_id=getattr(message, "message_thread_id", None))
+    qs = await _latest_session(session, message.chat.id, thread_id=topic_thread_id(message))
     if qs is None or qs.status != "paused":
         return await message.reply("لا يوجد اختبار متوقف مؤقتاً.")
     qs.status, qs.paused_at = "active", None
@@ -660,7 +674,7 @@ async def group_quiz_stop(message: Message, session):
     uid = message.from_user.id if message.from_user else 0
     if not (_anonymous_admin(message) or await is_chat_admin(message.bot, message.chat.id, uid)):
         return await message.reply("⛔ هذا الأمر لمشرفي المجموعة فقط.")
-    qs = await _latest_session(session, message.chat.id, only_active=True, thread_id=getattr(message, "message_thread_id", None))
+    qs = await _latest_session(session, message.chat.id, only_active=True, thread_id=topic_thread_id(message))
     if qs is None:
         return await message.reply("لا يوجد اختبار نشط في هذه المجموعة.")
     await finish_session(message.bot, qs.id)
@@ -668,7 +682,7 @@ async def group_quiz_stop(message: Message, session):
 
 @router.message(Command("quizresults"), F.chat.type.in_(GROUP_TYPES))
 async def group_quiz_results(message: Message, session):
-    qs = await _latest_session(session, message.chat.id, thread_id=getattr(message, "message_thread_id", None))
+    qs = await _latest_session(session, message.chat.id, thread_id=topic_thread_id(message))
     if qs is None:
         return await message.reply("لم يُنشر أي اختبار في هذه المجموعة بعد.")
     rows = await _leaderboard(session, qs.id)
@@ -788,7 +802,7 @@ async def group_quiz_schedule(message: Message, command: CommandObject, session)
     if utc <= utcnow():
         return await message.reply("موعد الجدولة يجب أن يكون في المستقبل.")
     session.add(GroupQuizSchedule(chat_id=message.chat.id, quiz_id=quiz_id,
-        thread_id=getattr(message, "message_thread_id", None), requested_by=uid,
+        thread_id=topic_thread_id(message), requested_by=uid,
         run_at=utc, repeat_mode=repeat, timezone=cfg.timezone))
     await session.commit()
     await message.reply(f"✅ تمت جدولة الاختبار #{quiz_id} بتاريخ {local:%Y-%m-%d %H:%M} ({cfg.timezone}).")
@@ -801,7 +815,7 @@ async def group_quiz_repost(message: Message, command: CommandObject, session):
     if not (_anonymous_admin(message) or await is_chat_admin(message.bot, message.chat.id, uid)):
         return await message.reply("⛔ إعادة النشر للمشرفين فقط.")
     raw = (command.args or "").strip()
-    qs = await _latest_session(session, message.chat.id, thread_id=getattr(message, "message_thread_id", None))
+    qs = await _latest_session(session, message.chat.id, thread_id=topic_thread_id(message))
     try:
         quiz_id = int(raw) if raw else (qs.quiz_id if qs else 0)
     except ValueError:
@@ -813,7 +827,7 @@ async def group_quiz_repost(message: Message, command: CommandObject, session):
     if not await _can_start_in_group(message.bot, message.chat.id, uid, _anonymous_admin(message), cfg):
         return await message.reply("⛔ لا تملك صلاحية إعادة النشر.")
     error = await _launch_publish(message.bot, quiz.id, message.chat.id, "group",
-        message.chat.title or "", uid, message.chat.id, getattr(message, "message_thread_id", None))
+        message.chat.title or "", uid, message.chat.id, topic_thread_id(message))
     if error:
         return await message.reply(error)
     await message.reply(f"🔁 بدأت إعادة نشر الاختبار #{quiz.id}.")
@@ -824,7 +838,7 @@ async def group_quiz_stats(message: Message, session):
     uid = message.from_user.id if message.from_user else 0
     if not (_anonymous_admin(message) or await is_chat_admin(message.bot, message.chat.id, uid)):
         return await message.reply("⛔ الإحصائيات للمشرفين فقط.")
-    qs = await _latest_session(session, message.chat.id, thread_id=getattr(message, "message_thread_id", None))
+    qs = await _latest_session(session, message.chat.id, thread_id=topic_thread_id(message))
     if qs is None:
         return await message.reply("لا توجد اختبارات مسجلة.")
     participant_count = await session.scalar(select(func.count(func.distinct(QuizSessionAnswer.user_telegram_id))).where(QuizSessionAnswer.session_id == qs.id)) or 0
@@ -879,7 +893,7 @@ async def group_quiz_export(message: Message, session, command: CommandObject):
     uid = message.from_user.id if message.from_user else 0
     if not await is_chat_admin(message.bot, message.chat.id, uid):
         return await message.reply("⛔ تصدير النتائج للمشرفين فقط.")
-    qs = await _latest_session(session, message.chat.id, thread_id=getattr(message, "message_thread_id", None))
+    qs = await _latest_session(session, message.chat.id, thread_id=topic_thread_id(message))
     if qs is None:
         return await message.reply("لا توجد نتائج.")
     rows = await _leaderboard(session, qs.id)
@@ -993,7 +1007,7 @@ async def group_quiz_stop(message: Message, session):
     uid = message.from_user.id if message.from_user else 0
     if not (_anonymous_admin(message) or await is_chat_admin(message.bot, message.chat.id, uid)):
         return await message.reply("⛔ هذا الأمر لمشرفي المجموعة فقط.")
-    qs = await _latest_session(session, message.chat.id, only_active=True, thread_id=getattr(message, "message_thread_id", None))
+    qs = await _latest_session(session, message.chat.id, only_active=True, thread_id=topic_thread_id(message))
     if qs is None:
         return await message.reply("لا يوجد اختبار نشط في هذه المجموعة.")
     await finish_session(message.bot, qs.id)
