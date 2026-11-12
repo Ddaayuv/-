@@ -1,0 +1,9 @@
+# Exact development dependency set verified with Python 3.12 on 2026-11-12.
+# Refresh with pip-compile --resolver=backtracking --output-file=requirements-dev.lock requirements-dev.in
+-r requirements.lock
+iniconfig==2.3.1
+packaging==26.3
+pluggy==1.7.0
+Pygments==2.21.0
+pytest==9.2.0
+ruff==0.17.4

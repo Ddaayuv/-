@@ -1,9 +1,7 @@
 from aiogram import Router, F
 from aiogram.filters import CommandStart, Command
-from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
-from sqlalchemy.ext.asyncio import AsyncSession
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from sqlalchemy import select, func
 from ..config import settings
 from ..db import Subject, Section, Item, get_setting

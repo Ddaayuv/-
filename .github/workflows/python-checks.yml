@@ -1,0 +1,29 @@
+name: Python checks
+
+on:
+  push:
+    branches: ["main", "feature/group-quiz-controls"]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements-dev.txt
+      - run: python -m ruff check bot tests
+      - run: python -m compileall -q bot tests
+      - run: python -m pytest -q
+      - name: Build Docker image
+        run: docker build -t steyat-bot:ci .
+      - name: Package source ZIP
+        run: zip -r group-quiz-controls.zip . -x ".git/*" ".env" "group-quiz-controls.zip" "*/__pycache__/*" ".pytest_cache/*" ".ruff_cache/*"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: group-quiz-controls
+          path: group-quiz-controls.zip
+          retention-days: 7

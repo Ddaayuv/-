@@ -1,0 +1,30 @@
+# Exact production dependency set verified with Python 3.12 on 2026-11-12.
+# Refresh with pip-compile --resolver=backtracking --output-file=requirements.lock requirements.in
+aiofiles==25.1.0
+aiogram==3.31.0
+aiohappyeyeballs==2.7.1
+aiohttp==3.14.5
+aiosignal==1.4.0
+aiosqlite==0.22.1
+annotated-types==0.8.0
+asyncpg==0.32.0
+attrs==26.1.0
+certifi==2026.10.23
+frozenlist==1.8.0
+greenlet==3.5.6
+idna==3.20
+magic-filter==1.0.12
+multidict==7.2.1
+propcache==0.5.4
+redis==6.4.0
+pydantic==2.13.5
+pydantic-core==2.46.5
+python-dotenv==1.2.4
+SQLAlchemy[asyncio]==2.1.8
+typing-extensions==4.16.0
+typing-inspection==0.4.5
+tzdata==2026.6
+yarl==1.25.1
+alembic==1.20.1
+Mako==1.3.10
+MarkupSafe==3.0.3

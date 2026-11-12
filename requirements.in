@@ -1,0 +1,8 @@
+aiogram>=3.13,<4
+SQLAlchemy[asyncio]>=2.0,<3
+aiosqlite>=0.20
+asyncpg>=0.29
+redis>=5,<7
+python-dotenv>=1.0
+tzdata>=2024.1
+alembic>=1.13,<2

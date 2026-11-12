@@ -3,7 +3,7 @@ import time
 from datetime import datetime, timezone
 from typing import Optional
 from sqlalchemy import (BigInteger, Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, event, inspect, select, text, update)
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from .config import settings
 from .utils import key, normalize
@@ -20,6 +20,7 @@ class User(Base):
     username: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
     joined_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     last_active: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
 class Subject(Base):
     __tablename__ = "subjects"
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -86,6 +87,14 @@ class BotSetting(Base):
     key: Mapped[str] = mapped_column(String(80), primary_key=True)
     value: Mapped[str] = mapped_column(Text, default="")
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
+
+class FSMStorageRecord(Base):
+    __tablename__ = "fsm_storage"
+    key: Mapped[str] = mapped_column(String(1024), primary_key=True)
+    state: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    data_json: Mapped[str] = mapped_column(Text, default="{}")
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
+
 
 class MenuButton(Base):
     __tablename__ = "menu_buttons"
@@ -166,6 +175,10 @@ class QuizSession(Base):
     total_questions: Mapped[int] = mapped_column(Integer, default=0)
     status: Mapped[str] = mapped_column(String(20), default="publishing")
     control_message_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    thread_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    paused_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    ends_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    settings_json: Mapped[str] = mapped_column(Text, default="{}")
     started_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 
@@ -205,6 +218,43 @@ class QuizTarget(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
 
+class GroupSettings(Base):
+    """Persistent quiz policy and defaults for a Telegram group/supergroup."""
+    __tablename__ = "group_settings"
+    chat_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    title: Mapped[str] = mapped_column(String(200), default="")
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    start_policy: Mapped[str] = mapped_column(String(24), default="all_admins")
+    allowed_admin_ids_json: Mapped[str] = mapped_column(Text, default="[]")
+    open_period: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    duration_seconds: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    shuffle_questions: Mapped[bool] = mapped_column(Boolean, default=False)
+    shuffle_options: Mapped[bool] = mapped_column(Boolean, default=False)
+    max_attempts: Mapped[int] = mapped_column(Integer, default=1)
+    explanation_mode: Mapped[str] = mapped_column(String(16), default="after")
+    anonymous_mode: Mapped[bool] = mapped_column(Boolean, default=False)
+    leaderboard_limit: Mapped[int] = mapped_column(Integer, default=10)
+    timezone: Mapped[str] = mapped_column(String(64), default=settings.timezone)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
+
+
+class GroupQuizSchedule(Base):
+    """A durable one-off or recurring quiz schedule for a group."""
+    __tablename__ = "group_quiz_schedules"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    chat_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    quiz_id: Mapped[int] = mapped_column(ForeignKey("quizzes.id", ondelete="CASCADE"), index=True)
+    thread_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    requested_by: Mapped[int] = mapped_column(BigInteger, default=0)
+    run_at: Mapped[datetime] = mapped_column(DateTime, index=True)
+    repeat_mode: Mapped[str] = mapped_column(String(12), default="none")
+    timezone: Mapped[str] = mapped_column(String(64), default=settings.timezone)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    last_run_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
 connect_args = {"timeout": 30} if settings.db_url.startswith("sqlite") else {}
 engine = create_async_engine(settings.db_url, connect_args=connect_args, pool_pre_ping=True)
 if settings.db_url.startswith("sqlite"):
@@ -215,14 +265,6 @@ Session = async_sessionmaker(engine, expire_on_commit=False)
 SECTIONS = [("lectures","المحاضرات","🎥","محاضرات,محاضره,فيديو,lectures,lecture,video"),("notes","الملاحظات","📝","ملاحظات,ملخصات,ملخص,notes,summary"),("practical","العملي","🧪","عملي,lab,labs,practical"),("files","الملفات","📄","ملفات,files,file,pdf"),("questions","الأسئلة","❓","اسئله,اسئلة,مراجعه,questions,quiz"),("key_points","أهم النقاط","⭐","مهم,اهم النقاط,important"),("resources","المصادر","📚","مصادر,مراجع,resources")]
 SUBJECTS = [("linux","أساسيات Linux","Linux Basics","🐧","لينكس,لينوكس,linux",True),("cyber-basics","أساسيات الأمن السيبراني","Cybersecurity Basics","🛡","الامن السيبراني,امن سيبراني,cybersecurity,security",True),("crypto","أساسيات التشفير","Cryptography Basics","🔐","التشفير,اساسيات التشفير,cryptography,crypto",False),("web-dev","برمجة المواقع","Web Development","🌐","ويب,web,برمجه مواقع",True),("statistics","الإحصاء","Statistics","📊","الاحصاء,احتمالية,احتمالات,الاحصاء الاحتمالي,statistics,stats",False),("pentest","اختبار الاختراق","Penetration Testing","🎯","pentest,penetration testing,اختراق",True),("arabic","اللغة العربية","Arabic","📖","عربي,العربيه,arabic",False),("networks","أساسيات الشبكات","Networking Basics","📡","الشبكات,شبكات,networking,network",True),("english","اللغة الإنكليزية","English","🔤","الانجليزيه,انجليزي,انكليزي,english",False),("ethics","الأخلاقيات","Ethics","⚖️","اخلاقيات,اخلاقيات مهنية,المهنة,ethics",False),("python","Python","Python","🐍","بايثون,بايثن,البايثون للامن السيبراني,python",True),("human-rights","حقوق الإنسان","Human Rights","🕊","حقوق الانسان,human rights",False)]
 DEFAULT_SETTINGS={"channel_id":str(settings.channel_id or ""),"channel_link":settings.channel_link,"force_sub":str(settings.require_membership).lower(),"new_user_alerts":"true","announce":str(settings.announce).lower()}
-def _sync_migrations(conn):
-    inspector=inspect(conn); subject_columns={c["name"] for c in inspector.get_columns("subjects")} if inspector.has_table("subjects") else set(); item_columns={c["name"] for c in inspector.get_columns("items")} if inspector.has_table("items") else set(); add_practical="has_practical" not in subject_columns; add_mode="study_mode" not in item_columns
-    if add_practical: conn.execute(text(f"ALTER TABLE subjects ADD COLUMN has_practical BOOLEAN NOT NULL DEFAULT {'0' if conn.dialect.name=='sqlite' else 'FALSE'}"))
-    if add_mode: conn.execute(text("ALTER TABLE items ADD COLUMN study_mode VARCHAR(20) NOT NULL DEFAULT 'general'"))
-    # quiz explanations: create_all does not add columns to tables that already exist
-    question_columns={c["name"] for c in inspector.get_columns("quiz_questions")} if inspector.has_table("quiz_questions") else set()
-    if question_columns and "explanation" not in question_columns: conn.execute(text("ALTER TABLE quiz_questions ADD COLUMN explanation TEXT"))
-    return add_practical,add_mode
 def snapshot_sqlite() -> str | None:
     """Copy the SQLite file next to itself before migrations so nothing can be lost silently."""
     if not settings.db_url.startswith("sqlite"): return None
@@ -236,10 +278,41 @@ def snapshot_sqlite() -> str | None:
     return dest
 async def db_counts(session) -> dict:
     from sqlalchemy import func
-    return {"users":await session.scalar(select(func.count(User.id))) or 0,"items":await session.scalar(select(func.count(Item.id))) or 0,"attachments":await session.scalar(select(func.count(Attachment.id))) or 0}
+    return {
+        "users": await session.scalar(select(func.count(User.id))) or 0,
+        "items": await session.scalar(select(func.count(Item.id))) or 0,
+        "attachments": await session.scalar(select(func.count(Attachment.id))) or 0,
+        "quizzes": await session.scalar(select(func.count(Quiz.id))) or 0,
+        "questions": await session.scalar(select(func.count(QuizQuestion.id))) or 0,
+        "active_sessions": await session.scalar(
+            select(func.count(QuizSession.id)).where(QuizSession.status.in_(("publishing", "active", "paused")))
+        ) or 0,
+    }
 async def init_db():
+    """Run additive Alembic migrations, then seed/repair application data."""
+    import asyncio
+    from pathlib import Path
+    from alembic import command
+    from alembic.config import Config
+
     snapshot_sqlite()
-    async with engine.begin() as conn: await conn.run_sync(Base.metadata.create_all); added_practical,added_mode=await conn.run_sync(_sync_migrations)
+
+    async with engine.connect() as connection:
+        def _was_practical_column_missing(sync_connection):
+            inspector = inspect(sync_connection)
+            if not inspector.has_table("subjects"):
+                return False
+            return "has_practical" not in {
+                column["name"] for column in inspector.get_columns("subjects")
+            }
+
+        added_practical = await connection.run_sync(_was_practical_column_missing)
+
+    project_root = Path(__file__).resolve().parent.parent
+    alembic_config = Config(str(project_root / "alembic.ini"))
+    alembic_config.set_main_option("script_location", str(project_root / "migrations"))
+    await asyncio.to_thread(command.upgrade, alembic_config, "head")
+
     async with Session() as s:
         if not await s.scalar(select(Section.id).limit(1)):
             for i,(slug,ar,em,al) in enumerate(SECTIONS): s.add(Section(slug=slug,name_ar=ar,emoji=em,aliases=al,sort_order=i))
@@ -258,10 +331,29 @@ async def init_db():
             if await s.get(BotSetting,k) is None: s.add(BotSetting(key=k,value=v))
 
         await s.commit()
-async def touch_user(session,tg_user):
-    u=await session.scalar(select(User).where(User.telegram_id==tg_user.id)); now=utcnow()
-    if u is None: session.add(User(telegram_id=tg_user.id,name=tg_user.full_name,username=tg_user.username,joined_at=now,last_active=now)); await session.flush(); return True
-    u.name,u.username,u.last_active=tg_user.full_name,tg_user.username,now; return False
+async def touch_user(session, tg_user, minimum_interval_seconds=300):
+    from .middleware_logic import should_refresh_last_active
+
+    user = await session.scalar(select(User).where(User.telegram_id == tg_user.id))
+    now = utcnow()
+    if user is None:
+        session.add(User(
+            telegram_id=tg_user.id,
+            name=tg_user.full_name,
+            username=tg_user.username,
+            joined_at=now,
+            last_active=now,
+        ))
+        await session.flush()
+        return True
+
+    if user.name != tg_user.full_name:
+        user.name = tg_user.full_name
+    if user.username != tg_user.username:
+        user.username = tg_user.username
+    if should_refresh_last_active(user.last_active, now, minimum_interval_seconds):
+        user.last_active = now
+    return False
 async def get_setting(session,name,default=""):
     row=await session.get(BotSetting,name); return row.value if row is not None else default
 async def set_setting(session,name,value):

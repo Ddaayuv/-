@@ -1,4 +1,3 @@
-import json
 from aiogram import F, Router
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
@@ -6,11 +5,13 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from sqlalchemy import func, select
 from ..config import settings
-from ..db import Item, MenuButton, Section, Subject, audit
+from ..db import Item, MenuButton, Section, Subject
 from ..menu_buttons import ACTION_CALLBACKS, ACTION_LABELS, MENU_TITLES, hidden_keys, save_hidden_keys
 from ..utils import esc, is_url
+from ..security import install_owner_guard
 
 router = Router()
+install_owner_guard(router, settings.owner_ids)
 
 class ButtonWizard(StatesGroup):
     label = State()
