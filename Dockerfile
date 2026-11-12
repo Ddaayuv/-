@@ -9,6 +9,8 @@ COPY requirements.lock ./
 RUN python -m pip install --upgrade pip && pip install -r requirements.lock
 
 COPY bot ./bot
+COPY migrations ./migrations
+COPY alembic.ini ./alembic.ini
 COPY railway.json ./railway.json
 
 RUN mkdir -p /app/data && groupadd --system bot && useradd --system --gid bot --home-dir /app bot && chown -R bot:bot /app
