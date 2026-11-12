@@ -58,6 +58,8 @@ async def main() -> None:
             BotCommand(command="adminpanel", description="لوحة المطوّر"),
             BotCommand(command="broadcast", description="إذاعة رسالة للمستخدمين"),
             BotCommand(command="quizgroups", description="إدارة مجموعات الاختبارات"),
+            BotCommand(command="status", description="حالة البوت"),
+            BotCommand(command="backup", description="نسخة احتياطية فورية"),
         ]
         for owner_id in settings.owner_ids:
             try:
