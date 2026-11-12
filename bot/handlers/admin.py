@@ -242,14 +242,14 @@ async def save_subject(m,raw,state,session):
 async def practical(m,command,session):
     if not owner(m.from_user.id):return
     try:s=await session.get(Subject,int((command.args or "").strip()))
-    except:s=None
+    except (ValueError, TypeError):s=None
     if not s:return await m.answer("الاستخدام: /practical رقم_المادة")
     s.has_practical=not s.has_practical; await m.answer("🧪 عملي + نظري" if s.has_practical else "📚 قسم واحد")
 @router.message(Command("togglesubject"))
 async def togglesubject(m,command,session):
     if not owner(m.from_user.id):return
     try:s=await session.get(Subject,int((command.args or "").strip()))
-    except:s=None
+    except (ValueError, TypeError):s=None
     if not s:return await m.answer("الاستخدام: /togglesubject رقم_المادة")
     s.is_active=not s.is_active; await m.answer(f"✅ تم {'إظهار' if s.is_active else 'إخفاء'} المادة.")
 @router.message(Command("setchannel"))
@@ -400,7 +400,7 @@ async def admin_home(cb,session):
 async def hide_unhide(m,command,session):
     if not owner(m.from_user.id):return
     try:item=await session.get(Item,int((command.args or "").strip()))
-    except:item=None
+    except (ValueError, TypeError):item=None
     if not item:return await m.answer("المحتوى غير موجود.")
     item.is_published=m.text.startswith("/unhide"); await m.answer("✅ تم التحديث.")
 @router.message(Command("status"))
