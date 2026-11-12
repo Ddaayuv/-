@@ -8,8 +8,10 @@ from ..config import settings
 from ..db import Item, MenuButton, Section, Subject
 from ..menu_buttons import ACTION_CALLBACKS, ACTION_LABELS, MENU_TITLES, hidden_keys, save_hidden_keys
 from ..utils import esc, is_url
+from ..security import install_owner_guard
 
 router = Router()
+install_owner_guard(router, settings.owner_ids)
 
 class ButtonWizard(StatesGroup):
     label = State()

@@ -8,9 +8,11 @@ from ..db import User, Subject, Section, Item, BotSetting, audit, set_setting, s
 from ..utils import esc, is_url
 import asyncio
 from .menu_manager import router as menu_manager_router
+from ..security import install_owner_guard
 from datetime import datetime, timedelta
 router=Router()
 router.include_router(menu_manager_router)
+install_owner_guard(router, settings.owner_ids)
 PROCESS_STARTED_AT = datetime.utcnow()
 def owner(uid): return uid in settings.owner_ids
 def grid(buttons,w=2): return [buttons[i:i+w] for i in range(0,len(buttons),w)]

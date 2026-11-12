@@ -229,3 +229,8 @@ python -m compileall -q bot tests
 - ملفا `requirements.in` و`requirements-dev.in` هما مدخلا pip-tools.
 - `requirements.lock` يقفل اعتماديات التشغيل، و`requirements-dev.lock` يقفل اعتماديات الاختبار وRuff أيضاً. Docker يثبت من `requirements.lock` فقط.
 - بعد تعديل المتطلبات، حدّث الملفين باستخدام `pip-compile --resolver=backtracking --output-file=requirements.lock requirements.in` و`pip-compile --resolver=backtracking --output-file=requirements-dev.lock requirements-dev.in` ثم شغّل CI.
+
+## حماية لوحة المطوّر — 12 نوفمبر 2026
+
+- أضيف OwnerOnlyMiddleware على معالجات الرسائل والـ callbacks في راوتر الإدارة وراوتر إدارة الأزرار؛ لذلك تشمل الحماية أوامر الإدارة وCallbacks وحالات FSM قبل وصولها إلى المعالجات.
+- الاستثناء الوحيد هو callback من النمط mb:<id> لعرض زر رسالة عام ضمن القائمة؛ وتبقى الأزرار المرتبطة بقائمة المطوّر محمية بفحص المالك داخل معالجها.
