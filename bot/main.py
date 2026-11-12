@@ -8,7 +8,7 @@ from aiogram.exceptions import TelegramAPIError
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.fsm.storage.memory import MemoryStorage
+from .fsm_storage import build_fsm_storage
 from aiogram.types import BotCommand, BotCommandScopeAllGroupChats, BotCommandScopeChat, BotCommandScopeDefault
 
 from .backup import backup_loop
@@ -30,7 +30,8 @@ async def main() -> None:
     try:
         me = await bot.get_me()
         runtime["bot_username"] = me.username or ""
-        dp = Dispatcher(storage=MemoryStorage())
+        storage, storage_backend = await build_fsm_storage()
+        dp = Dispatcher(storage=storage)
 
         async def handle_update_error(event: ErrorEvent) -> bool:
             global _last_error_notification
@@ -116,8 +117,8 @@ async def main() -> None:
             counts = await db_counts(_s)
         database_kind = "PostgreSQL" if settings.db_url.startswith("postgresql") else "SQLite"
         logging.info(
-            "Bot %s @%s started; database=%s; counts=%s",
-            settings.bot_version, runtime["bot_username"], database_kind, counts,
+            "Bot %s @%s started; database=%s; fsm_storage=%s; counts=%s",
+            settings.bot_version, runtime["bot_username"], database_kind, storage_backend, counts,
         )
         if counts["users"] == 0 and counts["items"] == 0:
             for owner_id in settings.owner_ids:
@@ -149,6 +150,7 @@ async def main() -> None:
                     await task
                 except asyncio.CancelledError:
                     pass
+            await dp.storage.close()
     finally:
         await bot.session.close()
 
