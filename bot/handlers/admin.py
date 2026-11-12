@@ -6,13 +6,14 @@ from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKe
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 from ..config import settings
-from ..db import User, Subject, Section, Item, BotSetting, audit, set_setting, setting_enabled, create_item, slugify, build_search_text
+from ..db import User, Subject, Section, Item, BotSetting, audit, set_setting, setting_enabled, create_item, slugify, build_search_text, db_counts, utcnow
 from ..utils import esc, is_url
 import asyncio
 from .menu_manager import router as menu_manager_router
 from datetime import datetime, timedelta
 router=Router()
 router.include_router(menu_manager_router)
+PROCESS_STARTED_AT = datetime.utcnow()
 def owner(uid): return uid in settings.owner_ids
 def grid(buttons,w=2): return [buttons[i:i+w] for i in range(0,len(buttons),w)]
 def panel_kb(): return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📊 الإحصائيات",callback_data="adm:stats"),InlineKeyboardButton(text="👥 المستخدمون",callback_data="adm:users")],[InlineKeyboardButton(text="➕ إضافة محتوى",callback_data="adm:add"),InlineKeyboardButton(text="📚 إدارة المواد",callback_data="adm:subjects")],[InlineKeyboardButton(text="📢 إذاعة",callback_data="adm:broadcast"),InlineKeyboardButton(text="⚙️ الإعدادات",callback_data="adm:settings")],[InlineKeyboardButton(text="🔒 الاشتراك الإجباري",callback_data="adm:forcesub"),InlineKeyboardButton(text="🔔 إشعارات الأعضاء",callback_data="adm:alerts")],[InlineKeyboardButton(text="📣 السماح بالإذاعة",callback_data="adm:announce"),InlineKeyboardButton(text="📖 عرض المواد",callback_data="adm:home")],[InlineKeyboardButton(text="🤖 إنشاء اختبار",callback_data="quiz:start"),InlineKeyboardButton(text="⚙️ إدارة الأزرار",callback_data="adm:buttons")]])
@@ -303,19 +304,54 @@ async def hide_unhide(m,command,session):
     except:item=None
     if not item:return await m.answer("المحتوى غير موجود.")
     item.is_published=m.text.startswith("/unhide"); await m.answer("✅ تم التحديث.")
-@router.callback_query(F.data=="adm:settings")
-async def settings_view(cb,session):
-    if not owner(cb.from_user.id):return await cb.answer("ممنوع",show_alert=True)
-    f=await setting_enabled(session,"force_sub"); a=await setting_enabled(session,"new_user_alerts",True); an=await setting_enabled(session,"announce",True); c=await session.get(BotSetting,"channel_id")
-    await cb.message.edit_text(f"⚙️ <b>الإعدادات</b>\n\n🔒 الاشتراك: {'ON' if f else 'OFF'}\n🔔 الأعضاء: {'ON' if a else 'OFF'}\n📣 الإذاعة: {'ON' if an else 'OFF'}\n📢 القناة: {esc(c.value if c else 'غير محددة')}",reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔒 الاشتراك",callback_data="adm:forcesub"),InlineKeyboardButton(text="🔔 الإشعارات",callback_data="adm:alerts")],[InlineKeyboardButton(text="📣 الإذاعة",callback_data="adm:announce")],[InlineKeyboardButton(text="⬅️ اللوحة",callback_data="adm:panel")]])); await cb.answer()
+@router.message(Command("status"))
+async def owner_status(m, session):
+    if not m.from_user or not owner(m.from_user.id):
+        return
 
+    from datetime import datetime
+    from ..config import settings
+
+    counts = await db_counts(session)
+    saved = await session.get(BotSetting, "last_backup_at")
+    last_backup = saved.value if saved and saved.value else "غير مسجلة"
+    database_kind = "PostgreSQL" if settings.db_url.startswith("postgresql") else "SQLite"
+    uptime = datetime.utcnow() - PROCESS_STARTED_AT
+    total_seconds = max(0, int(uptime.total_seconds()))
+    days, remainder = divmod(total_seconds, 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes = remainder // 60
+
+    await m.answer(
+        "<b>📊 حالة البوت</b>\\n"
+        f"النسخة: <code>{esc(settings.bot_version)}</code>\\n"
+        f"قاعدة البيانات: <code>{database_kind}</code>\\n"
+        f"المستخدمون: {counts['users']}\\n"
+        f"المحتوى: {counts['items']}\\n"
+        f"الاختبارات: {counts['quizzes']} ({counts['questions']} سؤال)\\n"
+        f"الجلسات النشطة: {counts['active_sessions']}\\n"
+        f"آخر نسخة احتياطية: <code>{esc(last_backup)}</code>\\n"
+        f"وقت التشغيل: {days} يوم، {hours} ساعة، {minutes} دقيقة"
+    )
 @router.message(Command("backup"))
-async def backup_now(m):
-    if not owner(m.from_user.id):return
+async def backup_now(m, session):
+    if not m.from_user or not owner(m.from_user.id):
+        return
     import os
     from aiogram.types import FSInputFile
     from ..backup import make_backup
-    path=await make_backup(); await m.answer_document(FSInputFile(path),caption="💾 نسخة كاملة (تشمل المرفقات). احتفظ بها. للاسترجاع أرسل الملف مع الأمر /restore كتعليق."); os.remove(path)
+
+    path = await make_backup()
+    try:
+        await m.answer_document(
+            FSInputFile(path),
+            caption="💾 نسخة احتياطية فورية. أرسل الملف مع /restore لاسترجاعه (إضافياً فقط).",
+        )
+        await set_setting(session, "last_backup_at", utcnow().isoformat())
+        await session.commit()
+    finally:
+        if os.path.exists(path):
+            os.remove(path)
 @router.message(Command("restore"))
 async def restore_cmd(m):
     if not owner(m.from_user.id):return
