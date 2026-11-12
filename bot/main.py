@@ -16,7 +16,7 @@ from .handlers.quiz import quiz_maintenance_loop, recover_group_quiz_sessions
 
 
 async def main() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    logging.basicConfig(level=getattr(logging, settings.log_level), format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     await init_db()
     bot = Bot(settings.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML, link_preview_is_disabled=True))
     try:
@@ -67,17 +67,31 @@ async def main() -> None:
 
         async with Session() as _s:
             counts = await db_counts(_s)
-        logging.info("DB: %s (%s)", counts, settings.db_url.split("://")[0])
+        database_kind = "PostgreSQL" if settings.db_url.startswith("postgresql") else "SQLite"
+        logging.info(
+            "Bot %s @%s started; database=%s; counts=%s",
+            settings.bot_version, runtime["bot_username"], database_kind, counts,
+        )
         if counts["users"] == 0 and counts["items"] == 0:
             for owner_id in settings.owner_ids:
                 try:
                     await bot.send_message(owner_id, "⚠️ قاعدة البيانات فارغة عند التشغيل. إذا كان عندك محتوى سابق فالتخزين غير دائم: فعّل Volume على Railway (DB_PATH=/app/data/bot.db) أو استخدم PostgreSQL عبر DATABASE_URL، ثم استرجع آخر نسخة بالأمر /restore.")
                 except Exception:
                     pass
+        if settings.backup_chat_id is None:
+            for owner_id in settings.owner_ids:
+                try:
+                    await bot.send_message(
+                        owner_id,
+                        "⚠️ النسخ الاحتياطي التلقائي غير مفعّل: لم يتم ضبط BACKUP_CHAT_ID. "
+                        "يمكنك استخدام /backup لاستلام نسخة فورية في الخاص.",
+                    )
+                except Exception:
+                    logging.exception("Could not warn owner %s about missing BACKUP_CHAT_ID", owner_id)
         await recover_group_quiz_sessions(bot)
         backup_task = asyncio.create_task(backup_loop(bot), name="daily-backup")
         quiz_task = asyncio.create_task(quiz_maintenance_loop(bot), name="group-quiz-maintenance")
-        logging.info("Bot @%s started; polling Telegram updates", runtime["bot_username"])
+        logging.info("Polling Telegram updates for bot version %s", settings.bot_version)
         try:
             await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
         finally:

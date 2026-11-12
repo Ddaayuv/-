@@ -4,6 +4,7 @@ import logging
 import os
 import tempfile
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from aiogram import Bot
 from aiogram.types import FSInputFile
@@ -13,7 +14,7 @@ from .config import settings
 from .db import (
     Admin, Attachment, BotSetting, Item, Section, Session, Subject, User, utcnow,
     Quiz, QuizQuestion, QuizAttempt, QuizPoll, QuizResponse, QuizSession,
-    QuizSessionPoll, QuizSessionAnswer, QuizTarget, GroupSettings, GroupQuizSchedule,
+    QuizSessionPoll, QuizSessionAnswer, QuizTarget, GroupSettings, GroupQuizSchedule, set_setting,
 )
 
 log = logging.getLogger(__name__)
@@ -110,7 +111,8 @@ async def build_backup_data() -> dict:
 
 async def make_backup() -> str:
     data = await build_backup_data()
-    path = os.path.join(tempfile.gettempdir(), f"steyat_backup_{datetime.now():%Y%m%d_%H%M%S}.json")
+    local_now = datetime.now(ZoneInfo(settings.timezone))
+    path = os.path.join(tempfile.gettempdir(), f"steyat_backup_{local_now:%Y%m%d_%H%M%S}.json")
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=1)
     return path
@@ -314,12 +316,22 @@ async def backup_loop(bot: Bot):
     while True:
         try:
             await asyncio.sleep(1800)
-            now = datetime.now()
+            now = datetime.now(ZoneInfo(settings.timezone))
             if now.hour == settings.backup_hour and last_day != now.date():
                 path = await make_backup()
-                await bot.send_document(settings.backup_chat_id, FSInputFile(path), caption="💾 نسخة احتياطية تلقائية")
-                os.remove(path)
-                last_day = now.date()
+                try:
+                    await bot.send_document(
+                        settings.backup_chat_id,
+                        FSInputFile(path),
+                        caption=f"💾 نسخة احتياطية تلقائية — {now:%Y-%m-%d %H:%M} {settings.timezone}",
+                    )
+                    async with Session() as session:
+                        await set_setting(session, "last_backup_at", utcnow().isoformat())
+                        await session.commit()
+                    last_day = now.date()
+                finally:
+                    if os.path.exists(path):
+                        os.remove(path)
         except asyncio.CancelledError:
             raise
         except Exception:

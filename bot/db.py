@@ -225,7 +225,7 @@ class GroupSettings(Base):
     explanation_mode: Mapped[str] = mapped_column(String(16), default="after")
     anonymous_mode: Mapped[bool] = mapped_column(Boolean, default=False)
     leaderboard_limit: Mapped[int] = mapped_column(Integer, default=10)
-    timezone: Mapped[str] = mapped_column(String(64), default="Asia/Baghdad")
+    timezone: Mapped[str] = mapped_column(String(64), default=settings.timezone)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
 
@@ -240,7 +240,7 @@ class GroupQuizSchedule(Base):
     requested_by: Mapped[int] = mapped_column(BigInteger, default=0)
     run_at: Mapped[datetime] = mapped_column(DateTime, index=True)
     repeat_mode: Mapped[str] = mapped_column(String(12), default="none")
-    timezone: Mapped[str] = mapped_column(String(64), default="Asia/Baghdad")
+    timezone: Mapped[str] = mapped_column(String(64), default=settings.timezone)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     last_run_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
@@ -288,7 +288,16 @@ def snapshot_sqlite() -> str | None:
     return dest
 async def db_counts(session) -> dict:
     from sqlalchemy import func
-    return {"users":await session.scalar(select(func.count(User.id))) or 0,"items":await session.scalar(select(func.count(Item.id))) or 0,"attachments":await session.scalar(select(func.count(Attachment.id))) or 0}
+    return {
+        "users": await session.scalar(select(func.count(User.id))) or 0,
+        "items": await session.scalar(select(func.count(Item.id))) or 0,
+        "attachments": await session.scalar(select(func.count(Attachment.id))) or 0,
+        "quizzes": await session.scalar(select(func.count(Quiz.id))) or 0,
+        "questions": await session.scalar(select(func.count(QuizQuestion.id))) or 0,
+        "active_sessions": await session.scalar(
+            select(func.count(QuizSession.id)).where(QuizSession.status.in_(("publishing", "active", "paused")))
+        ) or 0,
+    }
 async def init_db():
     snapshot_sqlite()
     async with engine.begin() as conn: await conn.run_sync(Base.metadata.create_all); added_practical,added_mode=await conn.run_sync(_sync_migrations)
