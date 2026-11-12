@@ -3,7 +3,7 @@ import time
 from datetime import datetime, timezone
 from typing import Optional
 from sqlalchemy import (BigInteger, Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, event, inspect, select, text, update)
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from .config import settings
 from .utils import key, normalize

@@ -14,7 +14,7 @@ import asyncio
 import json
 import logging
 import random
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from aiogram import Bot, F, Router
@@ -900,7 +900,6 @@ async def group_quiz_export(message: Message, session, command: CommandObject):
     lines = ["الترتيب,الاسم,الصحيحة,المجاب"]
     for i, (_user, name, correct, answered) in enumerate(rows, 1):
         lines.append(f'{i},"{name.replace(chr(34), chr(34)*2)}",{correct},{answered}')
-    import io
     doc = BufferedInputFile(("\n".join(lines)).encode("utf-8-sig"), filename=f"quiz-{qs.id}.csv")
     try:
         await message.bot.send_document(uid, doc, caption=f"نتائج الاختبار #{qs.quiz_id}")

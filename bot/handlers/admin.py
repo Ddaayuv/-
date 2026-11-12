@@ -1,12 +1,10 @@
 from aiogram import Router, F
-from aiogram.filters import Command, CommandObject
-from aiogram.fsm.context import FSMContext
+from aiogram.filters import Command
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from sqlalchemy import select, func
-from sqlalchemy.ext.asyncio import AsyncSession
 from ..config import settings
-from ..db import User, Subject, Section, Item, BotSetting, audit, set_setting, setting_enabled, create_item, slugify, build_search_text, db_counts, utcnow
+from ..db import User, Subject, Section, Item, BotSetting, audit, set_setting, setting_enabled, create_item, slugify, db_counts, utcnow
 from ..utils import esc, is_url
 import asyncio
 from .menu_manager import router as menu_manager_router
